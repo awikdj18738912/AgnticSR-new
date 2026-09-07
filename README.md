@@ -95,8 +95,9 @@ python -m system.live_asr \
 Use `--identity-refiner` only for ASR and chunking diagnostics. See [system/README.md](system/README.md) for model preparation and runtime options.
 
 The browser frontend can use either the Qwen3-ASR online backend or the
-Transformers Whisper rolling-window backend. Both expose the same streaming
-HTTP contract to the frontend; see [system/README.md](system/README.md).
+Transformers Whisper rolling-window backend. It also has an online/offline
+processing switch; both modes expose the same streaming HTTP contract to the
+frontend. See [system/README.md](system/README.md).
 
 ### 3. Selectable offline ASR backends
 

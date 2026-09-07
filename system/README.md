@@ -53,6 +53,10 @@ The browser frontend is ASR-backend agnostic. It talks to a streaming HTTP
 contract (`/stream/start`, `/stream/chunk`, and `/stream/finish`) and applies
 the same local Refiner to whatever text the backend returns.
 
+The web UI also provides an online/offline mode switch. Online mode refines
+changed ASR hypotheses as speech arrives. Offline mode buffers the recording
+and runs ASR plus one final Refiner pass only after the user stops recording.
+
 Qwen3-ASR is the low-latency online backend:
 
 ```bash

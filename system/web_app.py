@@ -87,8 +87,16 @@ def create_app(
     async def stream(websocket: WebSocket) -> None:
         await websocket.accept()
         requested_language = websocket.query_params.get("language") or language
+        requested_mode = (websocket.query_params.get("mode") or "online").lower()
+        if requested_mode not in {"online", "offline"}:
+            await websocket.send_json(
+                {"event": "error", "detail": "mode must be online or offline"}
+            )
+            await websocket.close()
+            return
         session_id: str | None = None
         last_raw_text = ""
+        buffered_audio = bytearray()
         finished = False
         try:
             start = _stream_request(
@@ -107,6 +115,13 @@ def create_app(
                     command = json.loads(text)
                     if command.get("event") != "finish":
                         continue
+                    if requested_mode == "offline" and buffered_audio:
+                        _stream_request(
+                            asr_url,
+                            "/stream/chunk",
+                            session_id,
+                            bytes(buffered_audio),
+                        )
                     payload = _stream_request(asr_url, "/stream/finish", session_id)
                     final_raw = str(payload.get("text", "")).strip()
                     detected_language = payload.get("language")
@@ -121,6 +136,7 @@ def create_app(
                                 output,
                                 {
                                     "captured_at": datetime.now(timezone.utc).isoformat(),
+                                    "mode": requested_mode,
                                     "asr_language": result["asr_language"],
                                     "output": {
                                         "raw_text": result["raw_text"],
@@ -136,6 +152,9 @@ def create_app(
                     break
                 audio = message.get("bytes")
                 if not audio:
+                    continue
+                if requested_mode == "offline":
+                    buffered_audio.extend(audio)
                     continue
                 payload = _stream_request(asr_url, "/stream/chunk", session_id, audio)
                 raw_text = str(payload.get("text", "")).strip()

@@ -14,6 +14,9 @@
     h1 { margin: 0; font-size: 28px; font-weight: 680; letter-spacing: 0; }
     .status { margin: 9px 0 0; color: #53615f; font-size: 14px; }
     .control { display: flex; align-items: center; gap: 16px; padding: 28px 0; border-bottom: 1px solid #c9d1cf; }
+    .mode { display: inline-flex; align-items: center; gap: 8px; color: #53615f; font-size: 14px; }
+    select { height: 40px; border: 1px solid #aebbb8; border-radius: 6px; background: #fff; color: #17201f; padding: 0 10px; font: inherit; }
+    select:disabled { opacity: .6; }
     button { min-width: 168px; height: 44px; border: 1px solid #006b60; border-radius: 6px; background: #006b60; color: #fff; font: inherit; font-weight: 650; cursor: pointer; display: inline-flex; align-items: center; justify-content: center; gap: 9px; }
     button:hover { background: #00584f; }
     button:disabled { cursor: wait; opacity: .6; }
@@ -36,28 +39,35 @@
     </header>
     <div class="control">
       <button id="record" type="button" title="开始实时转写"><i data-lucide="mic"></i><span>开始实时转写</span></button>
+      <label class="mode" for="mode">处理模式
+        <select id="mode">
+          <option value="online">在线：边说边修正</option>
+          <option value="offline">离线：结束后统一修正</option>
+        </select>
+      </label>
       <span id="timer" class="timer">00:00</span>
     </div>
     <div class="results">
       <section>
-        <h2>实时原始转写</h2>
+        <h2>原始转写</h2>
         <p id="raw" class="text"></p>
       </section>
       <section class="refined">
-        <h2>实时精修文本</h2>
+        <h2>精修文本</h2>
         <p id="clean" class="text"></p>
       </section>
     </div>
   </main>
   <script>
     const recordButton = document.querySelector('#record');
+    const modeSelect = document.querySelector('#mode');
     const status = document.querySelector('#status');
     const timer = document.querySelector('#timer');
     const raw = document.querySelector('#raw');
     const clean = document.querySelector('#clean');
     const targetRate = 16000;
     const chunkSamples = 8000;
-    let context, source, processor, stream, socket, buffered = new Float32Array(0), running = false, startedAt, ticker;
+    let context, source, processor, stream, socket, buffered = new Float32Array(0), running = false, startedAt, ticker, selectedMode = 'online';
 
     function setStatus(value, isError = false) {
       status.textContent = value;
@@ -100,7 +110,7 @@
 
     function websocketUrl() {
       const scheme = location.protocol === 'https:' ? 'wss' : 'ws';
-      return `${scheme}://${location.host}/ws/stream?language=Chinese`;
+      return scheme + '://' + location.host + '/ws/stream?language=Chinese&mode=' + encodeURIComponent(selectedMode);
     }
 
     function connectSocket() {
@@ -118,7 +128,7 @@
           if (data.clean_text !== undefined) clean.textContent = data.clean_text;
           if (data.event === 'update') setStatus('实时识别中');
           if (data.event === 'final') {
-            setStatus('已停止'); setButton(false); socket.close(); socket = null;
+            setStatus('已停止'); setButton(false); modeSelect.disabled = false; socket.close(); socket = null;
           }
         };
       });
@@ -141,7 +151,9 @@
 
     async function start() {
       try {
-        setButton(false, true); setStatus('正在连接实时识别服务');
+        selectedMode = modeSelect.value;
+        modeSelect.disabled = true;
+        setButton(false, true); setStatus('正在连接识别服务');
         await connectSocket();
         stream = await navigator.mediaDevices.getUserMedia({ audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true } });
         context = new AudioContext();
@@ -155,20 +167,21 @@
         source.connect(processor); processor.connect(context.destination);
         buffered = new Float32Array(0); raw.textContent = ''; clean.textContent = '';
         running = true; startedAt = Date.now(); ticker = setInterval(updateTimer, 250); updateTimer();
-        setButton(true); setStatus('实时识别中');
+        setButton(true); setStatus(selectedMode === 'offline' ? '录音中，停止后统一识别和精修' : '实时识别中');
       } catch (error) {
-        running = false; setButton(false); setStatus(`启动失败：${error.message}`, true);
+        running = false; modeSelect.disabled = false; setButton(false); setStatus('启动失败：' + error.message, true);
         if (socket) socket.close(); socket = null; await stopAudio();
       }
     }
 
     async function stop() {
-      running = false; clearInterval(ticker); setButton(true, true); setStatus('正在完成最后一段');
+      running = false; clearInterval(ticker); setButton(true, true);
+      setStatus(selectedMode === 'offline' ? '正在一次性识别和精修' : '正在完成最后一段');
       await stopAudio();
       if (socket && socket.readyState === WebSocket.OPEN) {
         if (buffered.length) socket.send(buffered.buffer);
         socket.send(JSON.stringify({ event: 'finish' }));
-      } else { setButton(false); setStatus('连接已关闭', true); }
+      } else { modeSelect.disabled = false; setButton(false); setStatus('连接已关闭', true); }
       buffered = new Float32Array(0);
     }
 
