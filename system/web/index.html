@@ -1,0 +1,179 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>AgenticASR</title>
+  <script src="https://unpkg.com/lucide@latest"></script>
+  <style>
+    :root { color-scheme: light; font-family: Inter, "Noto Sans SC", sans-serif; }
+    * { box-sizing: border-box; }
+    body { margin: 0; min-height: 100vh; background: #f4f6f5; color: #17201f; }
+    main { width: min(820px, calc(100% - 32px)); margin: 0 auto; padding: 56px 0; }
+    header { border-bottom: 1px solid #c9d1cf; padding-bottom: 20px; }
+    h1 { margin: 0; font-size: 28px; font-weight: 680; letter-spacing: 0; }
+    .status { margin: 9px 0 0; color: #53615f; font-size: 14px; }
+    .control { display: flex; align-items: center; gap: 16px; padding: 28px 0; border-bottom: 1px solid #c9d1cf; }
+    button { min-width: 168px; height: 44px; border: 1px solid #006b60; border-radius: 6px; background: #006b60; color: #fff; font: inherit; font-weight: 650; cursor: pointer; display: inline-flex; align-items: center; justify-content: center; gap: 9px; }
+    button:hover { background: #00584f; }
+    button:disabled { cursor: wait; opacity: .6; }
+    button.recording { background: #a62927; border-color: #a62927; }
+    button svg { width: 18px; height: 18px; }
+    .timer { color: #53615f; font-variant-numeric: tabular-nums; }
+    .results { display: grid; grid-template-columns: 1fr 1fr; gap: 28px; padding-top: 28px; }
+    section h2 { margin: 0 0 10px; font-size: 14px; font-weight: 680; color: #53615f; }
+    .text { min-height: 112px; margin: 0; white-space: pre-wrap; line-height: 1.7; font-size: 16px; }
+    .refined .text { font-weight: 600; }
+    .error { color: #a62927; }
+    @media (max-width: 620px) { main { padding-top: 32px; } .control { align-items: flex-start; flex-direction: column; } .results { grid-template-columns: 1fr; gap: 22px; } button { width: 100%; } }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <h1>AgenticASR</h1>
+      <p id="status" class="status">准备就绪</p>
+    </header>
+    <div class="control">
+      <button id="record" type="button" title="开始实时转写"><i data-lucide="mic"></i><span>开始实时转写</span></button>
+      <span id="timer" class="timer">00:00</span>
+    </div>
+    <div class="results">
+      <section>
+        <h2>实时原始转写</h2>
+        <p id="raw" class="text"></p>
+      </section>
+      <section class="refined">
+        <h2>实时精修文本</h2>
+        <p id="clean" class="text"></p>
+      </section>
+    </div>
+  </main>
+  <script>
+    const recordButton = document.querySelector('#record');
+    const status = document.querySelector('#status');
+    const timer = document.querySelector('#timer');
+    const raw = document.querySelector('#raw');
+    const clean = document.querySelector('#clean');
+    const targetRate = 16000;
+    const chunkSamples = 8000;
+    let context, source, processor, stream, socket, buffered = new Float32Array(0), running = false, startedAt, ticker;
+
+    function setStatus(value, isError = false) {
+      status.textContent = value;
+      status.classList.toggle('error', isError);
+    }
+
+    function setButton(isRecording, disabled = false) {
+      recordButton.disabled = disabled;
+      recordButton.classList.toggle('recording', isRecording);
+      recordButton.title = isRecording ? '结束实时转写' : '开始实时转写';
+      recordButton.innerHTML = isRecording
+        ? '<i data-lucide="square"></i><span>结束实时转写</span>'
+        : '<i data-lucide="mic"></i><span>开始实时转写</span>';
+      lucide.createIcons();
+    }
+
+    function updateTimer() {
+      const seconds = Math.floor((Date.now() - startedAt) / 1000);
+      timer.textContent = `${String(Math.floor(seconds / 60)).padStart(2, '0')}:${String(seconds % 60).padStart(2, '0')}`;
+    }
+
+    function join(a, b) {
+      const output = new Float32Array(a.length + b.length);
+      output.set(a); output.set(b, a.length);
+      return output;
+    }
+
+    function resample(input, fromRate) {
+      if (fromRate === targetRate) return input;
+      const ratio = targetRate / fromRate;
+      const output = new Float32Array(Math.round(input.length * ratio));
+      for (let index = 0; index < output.length; index += 1) {
+        const sourceIndex = index / ratio;
+        const left = Math.floor(sourceIndex);
+        const right = Math.min(left + 1, input.length - 1);
+        output[index] = input[left] + (input[right] - input[left]) * (sourceIndex - left);
+      }
+      return output;
+    }
+
+    function websocketUrl() {
+      const scheme = location.protocol === 'https:' ? 'wss' : 'ws';
+      return `${scheme}://${location.host}/ws/stream?language=Chinese`;
+    }
+
+    function connectSocket() {
+      return new Promise((resolve, reject) => {
+        socket = new WebSocket(websocketUrl());
+        socket.binaryType = 'arraybuffer';
+        const timeout = setTimeout(() => reject(new Error('连接超时')), 10000);
+        socket.onopen = () => { clearTimeout(timeout); resolve(); };
+        socket.onerror = () => { clearTimeout(timeout); reject(new Error('无法连接识别服务')); };
+        socket.onmessage = event => {
+          const data = JSON.parse(event.data);
+          if (data.event === 'ready') return;
+          if (data.event === 'error') { setStatus(`识别服务错误：${data.detail}`, true); return; }
+          if (data.raw_text !== undefined) raw.textContent = data.raw_text;
+          if (data.clean_text !== undefined) clean.textContent = data.clean_text;
+          if (data.event === 'update') setStatus('实时识别中');
+          if (data.event === 'final') {
+            setStatus('已停止'); setButton(false); socket.close(); socket = null;
+          }
+        };
+      });
+    }
+
+    function flushChunks() {
+      while (running && socket && socket.readyState === WebSocket.OPEN && buffered.length >= chunkSamples) {
+        socket.send(buffered.slice(0, chunkSamples).buffer);
+        buffered = buffered.slice(chunkSamples);
+      }
+    }
+
+    async function stopAudio() {
+      if (processor) { processor.disconnect(); processor.onaudioprocess = null; }
+      if (source) source.disconnect();
+      if (stream) stream.getTracks().forEach(track => track.stop());
+      if (context) await context.close();
+      processor = null; source = null; stream = null; context = null;
+    }
+
+    async function start() {
+      try {
+        setButton(false, true); setStatus('正在连接实时识别服务');
+        await connectSocket();
+        stream = await navigator.mediaDevices.getUserMedia({ audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true } });
+        context = new AudioContext();
+        source = context.createMediaStreamSource(stream);
+        processor = context.createScriptProcessor(4096, 1, 1);
+        processor.onaudioprocess = event => {
+          if (!running) return;
+          buffered = join(buffered, resample(event.inputBuffer.getChannelData(0), context.sampleRate));
+          flushChunks();
+        };
+        source.connect(processor); processor.connect(context.destination);
+        buffered = new Float32Array(0); raw.textContent = ''; clean.textContent = '';
+        running = true; startedAt = Date.now(); ticker = setInterval(updateTimer, 250); updateTimer();
+        setButton(true); setStatus('实时识别中');
+      } catch (error) {
+        running = false; setButton(false); setStatus(`启动失败：${error.message}`, true);
+        if (socket) socket.close(); socket = null; await stopAudio();
+      }
+    }
+
+    async function stop() {
+      running = false; clearInterval(ticker); setButton(true, true); setStatus('正在完成最后一段');
+      await stopAudio();
+      if (socket && socket.readyState === WebSocket.OPEN) {
+        if (buffered.length) socket.send(buffered.buffer);
+        socket.send(JSON.stringify({ event: 'finish' }));
+      } else { setButton(false); setStatus('连接已关闭', true); }
+      buffered = new Float32Array(0);
+    }
+
+    recordButton.addEventListener('click', () => running ? stop() : start());
+    lucide.createIcons();
+  </script>
+</body>
+</html>

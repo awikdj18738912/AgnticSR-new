@@ -1,0 +1,1 @@
+{"source_record_id": "test-001", "output": {"clean_text": "我想订明天10:00的票。", "error": null, "llm_latency_ms": 623.2565280006384, "ok": true, "raw_text": "那个我想订明天，呃，明天上午十点的票。", "stt_latency_ms": null, "total_latency_ms": null}}

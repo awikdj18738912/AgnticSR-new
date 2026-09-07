@@ -1,0 +1,8 @@
+{"captured_at": "2026-08-05T08:35:06.006890+00:00", "asr_language": "Chinese", "output": {"raw_text": "嗯。", "clean_text": "嗯。", "llm_latency_ms": 378.2621190039208}}
+{"captured_at": "2026-08-05T08:43:57.584066+00:00", "asr_language": "Chinese", "output": {"raw_text": "hello hello，你好，可以听得到吗？哎。", "clean_text": "你好，可以听得到吗？", "llm_latency_ms": 458.54922699800227}}
+{"captured_at": "2026-08-05T09:10:20.307994+00:00", "asr_language": "Chinese", "output": {"raw_text": "可以听到我说话吗？嗯，我想去北京西站。哦，不算了，去北京南站吧。嗯，现在是北京时间晚上七点十分。啊，有意思，有意思。", "clean_text": "可以听到我说话吗？我想去北京南站，现在是北京时间19:10。有意思。<KEY>[北京南站]", "llm_latency_ms": 592}}
+{"captured_at": "2026-09-07T11:38:57.700337+00:00", "asr_language": "Chinese", "output": {"raw_text": "我有一千一百一十五块。我是一个傻逼，不对，我是一个傻逼。很喜欢我，很喜欢我。我我我也不知道，嗯，这个事儿呢，他我也不太懂。你觉得这个事儿是个怎么个事儿呢？", "clean_text": "我有一1115元。我是一个傻逼，很喜欢我。这个事儿我也不太懂，你觉得这个事儿是个怎么个事儿呢？", "llm_latency_ms": 588}}
+{"captured_at": "2026-09-07T11:39:02.219154+00:00", "asr_language": "Chinese", "output": {"raw_text": "嗯。", "clean_text": "嗯。", "llm_latency_ms": 70}}
+{"captured_at": "2026-09-07T11:39:05.079467+00:00", "asr_language": "Chinese", "output": {"raw_text": "嗯。", "clean_text": "嗯。", "llm_latency_ms": 69}}
+{"captured_at": "2026-09-07T11:39:09.925815+00:00", "asr_language": "Chinese", "output": {"raw_text": "嗯。", "clean_text": "嗯。", "llm_latency_ms": 77}}
+{"captured_at": "2026-09-07T14:23:01.275438+00:00", "asr_language": "Chinese", "output": {"raw_text": "我有一千一百一十五块钱。我买了一个苹果。哦，不对，我买了一个梨。然后我昨天想去北京，但是我没去，我去的上海。然后今天是二零二五年十二月五日。我想去北京。哦，不对，我想去上海。我我我我也不知道。我也不知道啊，到底是怎么回事。我嗯，我其实也喜欢你。", "clean_text": "我有一1115元。我买了一个梨。然后我昨天想去上海，但是我没去。今天是2025年12月5日。我想去上海。我也不知道到底是怎么回事。我其实也喜欢你。", "llm_latency_ms": 817}}
