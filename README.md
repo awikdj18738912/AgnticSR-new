@@ -94,6 +94,34 @@ python -m system.live_asr \
 
 Use `--identity-refiner` only for ASR and chunking diagnostics. See [system/README.md](system/README.md) for model preparation and runtime options.
 
+The browser frontend can use either the Qwen3-ASR online backend or the
+Transformers Whisper rolling-window backend. Both expose the same streaming
+HTTP contract to the frontend; see [system/README.md](system/README.md).
+
+### 3. Selectable offline ASR backends
+
+Run an audio file through Qwen3-ASR (the default) or Whisper and then the same
+Refiner:
+
+```bash
+python experiments/scripts/transcribe_and_refine.py \
+  path/to/example.wav results/e2e/result.jsonl \
+  --asr-backend qwen3 \
+  --asr-model /path/to/Qwen3-ASR-0.6B \
+  --refiner-model /path/to/AgenticASR-Refiner
+```
+
+For a local Hugging Face Whisper checkpoint, change the backend and model:
+
+```bash
+python experiments/scripts/transcribe_and_refine.py \
+  path/to/example.wav results/e2e/whisper.jsonl \
+  --asr-backend whisper \
+  --asr-model /path/to/whisper-model \
+  --refiner-model /path/to/AgenticASR-Refiner \
+  --asr-env agentic-asr
+```
+
 ## Training
 
 ### 1. Generate Refiner training data

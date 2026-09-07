@@ -1,4 +1,4 @@
-"""Browser WebSocket UI for local streaming Qwen3-ASR and AgenticASR."""
+"""Browser WebSocket UI for a pluggable streaming ASR backend and AgenticASR."""
 
 from __future__ import annotations
 
@@ -45,9 +45,9 @@ def _stream_request(
         with urllib.request.urlopen(request, timeout=120) as response:
             payload = json.loads(response.read().decode("utf-8"))
     except urllib.error.URLError as error:
-        raise RuntimeError(f"Qwen3-ASR streaming request failed: {error}") from error
+        raise RuntimeError(f"streaming ASR request failed: {error}") from error
     if not isinstance(payload, dict) or payload.get("error"):
-        raise RuntimeError(f"Qwen3-ASR streaming error: {payload}")
+        raise RuntimeError(f"streaming ASR error: {payload}")
     return payload
 
 

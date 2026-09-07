@@ -47,6 +47,51 @@ python -m system.live_asr \
   --refiner models/refiner-mlx
 ```
 
+## Selectable ASR backends for the browser frontend
+
+The browser frontend is ASR-backend agnostic. It talks to a streaming HTTP
+contract (`/stream/start`, `/stream/chunk`, and `/stream/finish`) and applies
+the same local Refiner to whatever text the backend returns.
+
+Qwen3-ASR is the low-latency online backend:
+
+```bash
+CUDA_VISIBLE_DEVICES=1 conda run --no-capture-output -n qwen3-asr \
+  python -m system.qwen_asr_stream_server \
+  --model /path/to/Qwen3-ASR-0.6B \
+  --gpu-memory-utilization 0.55 \
+  --port 8766
+```
+
+Whisper is also supported through a rolling-window backend. Whisper is not an
+online transducer, so it re-transcribes the accumulated utterance every few
+seconds; this is more compute-heavy but uses the same browser UI:
+
+```bash
+CUDA_VISIBLE_DEVICES=1 conda run --no-capture-output -n agentic-asr \
+  python -m system.whisper_stream_server \
+  --model /path/to/whisper-model \
+  --device cuda:0 \
+  --language Chinese \
+  --update-interval-seconds 1.5 \
+  --port 8766
+```
+
+Start the frontend against either backend:
+
+```bash
+CUDA_VISIBLE_DEVICES=1 conda run --no-capture-output -n agentic-asr \
+  python -m system.web_app \
+  --refiner-model /path/to/AgenticASR-Refiner \
+  --refiner-device cuda:0 \
+  --asr-url http://127.0.0.1:8766 \
+  --language Chinese \
+  --port 8081
+```
+
+The Whisper backend accepts a local Hugging Face Whisper directory or a model
+id such as `openai/whisper-small`; use a local directory for offline runs.
+
 ## Local Qwen3-ASR + Refiner microphone mode
 
 The original `live_asr.py` requires a sherpa-onnx online ASR model and an MLX

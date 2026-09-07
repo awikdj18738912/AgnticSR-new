@@ -4,6 +4,11 @@ sherpa-onnx>=1.13.2
 sounddevice>=0.5
 soundfile>=0.12
 
+# Optional Whisper backend (the current implementation uses Transformers).
+# Install these in the environment that runs system.whisper_stream_server:
+# torch>=2.4
+# transformers>=5.6,<6
+
 # Optional on Apple Silicon for --refiner
 # mlx>=0.25
 # mlx-lm>=0.31
