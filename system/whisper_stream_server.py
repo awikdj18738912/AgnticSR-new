@@ -28,6 +28,7 @@ class Session:
     last_transcribed_count: int = 0
     last_seen: float = 0.0
     text: str = ""
+    cancelled: bool = False
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -76,6 +77,8 @@ def main(argv: list[str] | None = None) -> int:
         if waveform.size == 0:
             return
         with model_lock:
+            if session.cancelled:
+                return
             session.text = whisper.transcribe(waveform, language)
         session.last_transcribed_count = session.sample_count
 
@@ -114,6 +117,17 @@ def main(argv: list[str] | None = None) -> int:
             return jsonify(error="invalid session_id"), 400
         transcribe_if_ready(session, force=True)
         return jsonify(language=language or "", text=session.text)
+
+    @app.post("/stream/cancel")
+    def cancel():
+        session_id = request.args.get("session_id", "")
+        with sessions_lock:
+            session = sessions.pop(session_id, None)
+            if session is not None:
+                session.cancelled = True
+        if session is None:
+            return jsonify(error="invalid session_id"), 400
+        return jsonify(cancelled=True)
 
     print(f"Whisper streaming service listening on http://{args.host}:{args.port}", flush=True)
     app.run(host=args.host, port=args.port, debug=False, threaded=True, use_reloader=False)

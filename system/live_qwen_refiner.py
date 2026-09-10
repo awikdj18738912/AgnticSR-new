@@ -20,20 +20,31 @@ import wave
 from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Iterable
 
 import numpy as np
 
 from .backends import EnergyVad, SAMPLE_RATE, VAD_WINDOW, normalize_cjk
+from .entity_store import EntityStore
+from .protection import EntityProtector
+from .session_memory import SessionEntityMemory
 
 SYSTEM_PROMPT = (
     "你是 ASR 文本纠错助手。保留原意，最小修改：去口癖/重复，修错字，补必要标点，"
     "规范数字、日期、术语和代码符号，处理自我修正。不要总结、扩写或解释。"
-    "重要易错实体在末尾追加 <KEY>[词1、词2]；没有则不加。"
+    "输入末尾的 <KEY>[词1、词2] 是已验证术语表；仅在原文已出现对应名称或别名时"
+    "使用它来纠错或规范为标准名称，不得据此添加原文未提及的实体，也不要在输出中保留 <KEY>。"
 )
 
 
 class TransformersRefiner:
     """Local Transformers backend matching the offline Refiner prompt."""
+
+    # Prevent a malformed or unusually long request from keeping the WebSocket
+    # open forever. ``generate(max_time=...)`` returns the best partial output
+    # available; the caller quality-checks it and falls back to source text
+    # when it is incomplete.
+    GENERATION_MAX_TIME_SECONDS = 12.0
 
     def __init__(self, model_path: Path, device_map: str, max_new_tokens: int) -> None:
         try:
@@ -56,10 +67,16 @@ class TransformersRefiner:
             {"enable_thinking": False} if "enable_thinking" in template else {}
         )
 
-    def refine(self, raw_text: str) -> tuple[str, float]:
+    def refine(
+        self, raw_text: str, *, entity_hints: Iterable[str] = ()
+    ) -> tuple[str, float]:
+        hints = tuple(dict.fromkeys(item.strip() for item in entity_hints if item.strip()))
+        user_content = raw_text
+        if hints:
+            user_content = f"{raw_text}\n<KEY>[{'、'.join(hints[:16])}]"
         messages = [
             {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": raw_text},
+            {"role": "user", "content": user_content},
         ]
         inputs = self._tokenizer.apply_chat_template(
             messages,
@@ -71,15 +88,14 @@ class TransformersRefiner:
         )
         device = self._model.get_input_embeddings().weight.device
         inputs = inputs.to(device)
-        if self._torch.cuda.is_available():
-            self._torch.cuda.synchronize()
         started = time.perf_counter()
         with self._torch.inference_mode():
             generated = self._model.generate(
-                **inputs, max_new_tokens=self._max_new_tokens, do_sample=False
+                **inputs,
+                max_new_tokens=self._max_new_tokens,
+                max_time=self.GENERATION_MAX_TIME_SECONDS,
+                do_sample=False
             )
-        if self._torch.cuda.is_available():
-            self._torch.cuda.synchronize()
         input_width = inputs["input_ids"].shape[1]
         text = self._tokenizer.decode(
             generated[0, input_width:], skip_special_tokens=True
@@ -154,6 +170,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--preroll", type=float, default=0.5)
     parser.add_argument("--refiner-max-new-tokens", type=int, default=256)
     parser.add_argument("--output", type=Path, help="append utterance records as JSONL")
+    parser.add_argument(
+        "--entity-db",
+        type=Path,
+        help="optional SQLite database containing verified protected entities",
+    )
     args = parser.parse_args(argv)
     if args.preroll < 0 or args.asr_timeout <= 0:
         parser.error("--preroll must be non-negative and --asr-timeout must be positive")
@@ -180,6 +201,18 @@ def main(argv: list[str] | None = None) -> int:
     refiner = TransformersRefiner(
         refiner_model_path, args.refiner_device, args.refiner_max_new_tokens
     )
+    memory = SessionEntityMemory()
+    if args.entity_db is not None:
+        entity_store = EntityStore(args.entity_db.resolve())
+        entity_definitions = entity_store.list_entities()
+        print(
+            f"Loaded {len(entity_definitions)} protected entities from "
+            f"{args.entity_db.resolve()}",
+            flush=True,
+        )
+    else:
+        entity_definitions = ()
+    protector = EntityProtector(entity_definitions, session_memory=memory)
     print(f"Using Qwen3-ASR service at {args.asr_url}")
     print("Listening. Press Ctrl+C to stop.", flush=True)
 
@@ -198,9 +231,18 @@ def main(argv: list[str] | None = None) -> int:
         raw_text = normalize_cjk(raw_text).strip()
         if not raw_text:
             return
-        refined_text, latency_ms = refiner.refine(raw_text)
+        protection = protector.protect(raw_text)
+        refined_text, latency_ms = refiner.refine(
+            raw_text, entity_hints=protector.refinement_hints(protection)
+        )
+        refined_text, entity_normalizations = protector.normalize_verified_aliases(
+            refined_text, protection
+        )
+        entity_audit_issues = protector.audit_unmasked(refined_text, protection)
         print(f"[raw] {raw_text}")
         print(f"[refined {latency_ms:.0f}ms] {refined_text}", flush=True)
+        if entity_audit_issues:
+            print(f"[entity audit] {', '.join(entity_audit_issues)}", flush=True)
         if args.output:
             _append_record(
                 args.output.resolve(),
@@ -212,6 +254,13 @@ def main(argv: list[str] | None = None) -> int:
                         "raw_text": raw_text,
                         "clean_text": refined_text,
                         "llm_latency_ms": latency_ms,
+                        "refiner_accepted": True,
+                        "refiner_reject_reasons": [],
+                        "entity_audit_issues": list(entity_audit_issues),
+                        "entity_normalizations": list(entity_normalizations),
+                        "protected_entities": [
+                            span.public_dict() for span in protection.spans
+                        ],
                     },
                 },
             )

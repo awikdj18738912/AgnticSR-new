@@ -37,6 +37,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--asr-max-new-tokens", type=int, default=256)
     parser.add_argument("--refiner-max-new-tokens", type=int, default=1024)
     parser.add_argument("--json-output", type=Path)
+    parser.add_argument(
+        "--entity-db",
+        type=Path,
+        help="optional SQLite database containing verified protected entities",
+    )
     return parser.parse_args()
 
 
@@ -122,11 +127,14 @@ print(f"ASR raw text: {text}")
         ]
 
     run(asr_command)
-    run([
+    refine_command = [
         "conda", "run", "--no-capture-output", "-n", args.refiner_env, "python",
         str(POSTPROCESS_SCRIPT), str(raw_output), str(output), "--model", str(refiner_model),
         "--batch-size", "1", "--max-new-tokens", str(args.refiner_max_new_tokens), "--overwrite",
-    ])
+    ]
+    if args.entity_db is not None:
+        refine_command.extend(["--entity-db", str(args.entity_db.resolve())])
+    run(refine_command)
     result_lines = output.read_text(encoding="utf-8").splitlines()
     if len(result_lines) != 1:
         raise ValueError(f"expected one refined result record, found {len(result_lines)}")

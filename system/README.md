@@ -53,19 +53,30 @@ The browser frontend is ASR-backend agnostic. It talks to a streaming HTTP
 contract (`/stream/start`, `/stream/chunk`, and `/stream/finish`) and applies
 the same local Refiner to whatever text the backend returns.
 
-The web UI also provides an online/offline mode switch. Online mode refines
-changed ASR hypotheses as speech arrives. Offline mode buffers the recording
-and runs ASR plus one final Refiner pass only after the user stops recording.
+The web UI provides one microphone mode and two local-file modes. Online mode
+uses the microphone and refines changed ASR hypotheses synchronously as speech
+arrives. Offline mode selects a local audio file, transcribes the entire file,
+then runs one final Refiner pass. Streaming mode also selects a local audio
+file, sends it in PCM chunks, and refines only the latest pending hypothesis in
+a background task so Refiner latency does not block transcription updates.
 
 Qwen3-ASR is the low-latency online backend:
 
 ```bash
-CUDA_VISIBLE_DEVICES=1 conda run --no-capture-output -n qwen3-asr \
+CUDA_VISIBLE_DEVICES=0 conda run --no-capture-output -n qwen3-asr \
   python -m system.qwen_asr_stream_server \
   --model /path/to/Qwen3-ASR-0.6B \
   --gpu-memory-utilization 0.55 \
+  --max-model-len 32768 \
   --port 8766
 ```
+
+The service bounds each Qwen streaming state to protect long recordings from
+the upstream implementation's growing full-audio reprocessing cost. It starts
+a fresh state at a sentence boundary after 30 seconds and always rotates by 45
+seconds, while preserving the cumulative transcript. Use `--segment-seconds`
+and `--max-segment-seconds` to tune these limits. Abandoned browser sessions
+are cancelled so their queued chunks do not continue occupying the GPU.
 
 Whisper is also supported through a rolling-window backend. Whisper is not an
 online transducer, so it re-transcribes the accumulated utterance every few
@@ -96,6 +107,71 @@ CUDA_VISIBLE_DEVICES=1 conda run --no-capture-output -n agentic-asr \
 The Whisper backend accepts a local Hugging Face Whisper directory or a model
 id such as `openai/whisper-small`; use a local directory for offline runs.
 
+## Protected entity database and session memory
+
+The frontend audits numbers, dates, email addresses, URLs, identifiers, and
+verified domain entities alongside each Refiner request. When a verified alias
+is explicitly present in an ASR hypothesis, its canonical form is supplied as
+a short Refiner glossary. For an entity using `normalize`, that exact alias is
+then deterministically normalized in the Refiner output and recorded in the
+session log. This does not use fuzzy global replacement: an unrelated or
+unmatched database entry cannot change the displayed text.
+
+Create or update the local SQLite term database:
+
+```bash
+python -m system.manage_entities --db data/entities.db add AgenticASR \
+  --alias "Agentic SR" \
+  --type PROJECT \
+  --policy normalize \
+  --priority 10
+
+python -m system.manage_entities --db data/entities.db add Qwen3-ASR \
+  --alias "Qwen ASR" \
+  --type MODEL \
+  --policy normalize
+
+python -m system.manage_entities --db data/entities.db list
+```
+
+`preserve` keeps the exact matched surface. `normalize` restores the verified
+canonical spelling when an explicit alias is matched. Fuzzy matches never
+replace text automatically.
+
+Enable the database in the browser frontend:
+
+```bash
+CUDA_VISIBLE_DEVICES=1 conda run --no-capture-output -n agentic-asr \
+  python -m system.web_app \
+  --refiner-model /path/to/AgenticASR-Refiner \
+  --refiner-device cuda:0 \
+  --asr-url http://127.0.0.1:8766 \
+  --entity-db data/entities.db \
+  --output results/web/session.jsonl \
+  --port 8081
+```
+
+When the server is started with `--entity-db`, the browser page also exposes a
+local **术语库管理** panel. It can search, add, edit, enable/disable, and
+permanently delete verified entities and aliases. Changes are stored only in
+the configured SQLite file and are loaded by the next transcription session;
+they do not interrupt a running session or force a rewrite of displayed text.
+
+Entity types and domains are fixed selectable categories in the panel. The
+main page also provides a **术语领域** selector. A new session loads entries in
+the chosen domain plus entries in `general`; for example, selecting `医疗`
+loads `医疗` and `通用` entities. This selection only changes entity auditing,
+the Refiner glossary, and verified-alias normalization; it does not change the
+ASR model itself.
+
+Each WebSocket connection also gets a bounded in-memory entity memory.
+Database entities are immediately trusted. A newly observed entity is not
+allowed to constrain later text unless it has multiple independent
+high-confidence observations with distinct stable-segment IDs. Repeated
+partial hypotheses do not count as independent evidence, and missing ASR
+confidence never promotes an entity automatically. This avoids turning one
+ASR or Refiner error into persistent session memory.
+
 ## Local Qwen3-ASR + Refiner microphone mode
 
 The original `live_asr.py` requires a sherpa-onnx online ASR model and an MLX
@@ -124,6 +200,7 @@ Then start the microphone client in that environment:
 python -m system.live_qwen_refiner \
   --refiner-model /path/to/AgenticASR-Refiner \
   --refiner-device cuda:1 \
+  --entity-db data/entities.db \
   --output results/live/session.jsonl
 ```
 

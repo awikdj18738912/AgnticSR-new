@@ -8,8 +8,14 @@ The public scripts here cover inference and benchmark scoring. Paper-only plots,
 python experiments/scripts/postprocess_asr.py \
   path/to/asr_output.jsonl \
   path/to/refined_output.jsonl \
-  --model /path/to/refiner-checkpoint
+  --model /path/to/refiner-checkpoint \
+  --entity-db data/entities.db
 ```
+
+The entity database is optional. Even without it, deterministic patterns such
+as numbers, dates, email addresses, URLs, and model identifiers are masked
+before refinement and restored afterwards. Invalid placeholder output falls
+back to the original ASR text and is recorded in the result JSONL.
 
 ## Benchmark Judge
 

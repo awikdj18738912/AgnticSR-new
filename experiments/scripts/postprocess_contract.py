@@ -21,6 +21,9 @@ class InferenceOutcome:
     clean_text: str | None
     llm_latency_ms: float
     error: str | None
+    refiner_accepted: bool | None = None
+    refiner_reject_reasons: tuple[str, ...] = ()
+    protected_entities: tuple[JsonObject, ...] = ()
 
 
 def _output_object(record: JsonObject) -> JsonObject:
@@ -64,7 +67,10 @@ def build_result_record(source: JsonObject, outcome: InferenceOutcome) -> JsonOb
         "error": outcome.error,
         "llm_latency_ms": outcome.llm_latency_ms,
         "ok": outcome.error is None,
+        "protected_entities": list(outcome.protected_entities),
         "raw_text": raw_text,
+        "refiner_accepted": outcome.refiner_accepted,
+        "refiner_reject_reasons": list(outcome.refiner_reject_reasons),
         "stt_latency_ms": stt_latency,
         "total_latency_ms": total_latency,
     }

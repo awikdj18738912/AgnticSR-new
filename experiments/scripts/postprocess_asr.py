@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -21,6 +22,13 @@ from postprocess_contract import (
     extract_raw_text,
     source_record_id,
 )
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from system.entity_store import EntityStore
+from system.protection import EntityProtector, ProtectionResult
 
 SYSTEM_PROMPT = (
     "你是 ASR 文本纠错助手。保留原意，最小修改：去口癖/重复，修错字，补必要标点，"
@@ -50,6 +58,7 @@ class RunConfig:
     limit: int | None
     overwrite: bool
     validate_only: bool
+    entity_db: Path | None
     model: ModelConfig
 
 
@@ -68,6 +77,10 @@ def thinking_template_kwargs(template: str) -> dict[str, bool]:
 
 
 class TransformersPostprocessor:
+    # A malformed or unusually long sample must not leave the batch process
+    # waiting forever after ASR has already written the raw transcript.
+    GENERATION_MAX_TIME_SECONDS = 30.0
+
     def __init__(self, config: ModelConfig) -> None:
         self._config = config
         self._tokenizer = AutoTokenizer.from_pretrained(
@@ -104,6 +117,7 @@ class TransformersPostprocessor:
         started = time.perf_counter()
         generation_args = {
             "max_new_tokens": self._config.max_new_tokens,
+            "max_time": self.GENERATION_MAX_TIME_SECONDS,
             "do_sample": self._config.do_sample,
         }
         if self._config.do_sample:
@@ -143,6 +157,11 @@ def parse_args() -> RunConfig:
     parser.add_argument("--limit", type=int)
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--validate-only", action="store_true")
+    parser.add_argument(
+        "--entity-db",
+        type=Path,
+        help="optional SQLite database containing verified protected entities",
+    )
     args = parser.parse_args()
     if args.batch_size < 1:
         parser.error("--batch-size must be at least 1")
@@ -157,6 +176,7 @@ def parse_args() -> RunConfig:
         limit=args.limit,
         overwrite=args.overwrite,
         validate_only=args.validate_only,
+        entity_db=args.entity_db.resolve() if args.entity_db else None,
         model=ModelConfig(
             model_path=args.model,
             device_map=args.device_map,
@@ -225,26 +245,42 @@ def run(config: RunConfig) -> int:
     if not pending:
         print("No pending records.")
         return 0
+    definitions = (
+        EntityStore(config.entity_db).list_entities()
+        if config.entity_db is not None
+        else ()
+    )
+    protector = EntityProtector(definitions)
     processor = TransformersPostprocessor(config.model) if valid_records else None
     for offset in range(0, len(pending), config.batch_size):
         batch = pending[offset : offset + config.batch_size]
-        batch_raw_texts: list[str] = []
+        batch_inputs: list[str] = []
+        batch_protections: list[ProtectionResult] = []
         for record in batch:
             try:
-                batch_raw_texts.append(extract_raw_text(record))
+                raw_text = extract_raw_text(record)
             except PostprocessError:
                 continue
+            protection = protector.protect(raw_text)
+            batch_inputs.append(raw_text)
+            batch_protections.append(protection)
         generated_texts: list[str] = []
         latency_ms = 0.0
-        if batch_raw_texts:
+        if batch_inputs:
             if processor is None:
                 raise PostprocessError("Postprocessor was not initialized")
-            generated_texts, latency_ms = processor.generate(batch_raw_texts)
+            print(
+                f"Refining records {offset + 1}-{offset + len(batch)} "
+                f"({len(batch_inputs)} valid inputs)...",
+                flush=True,
+            )
+            generated_texts, latency_ms = processor.generate(batch_inputs)
         generated_iterator = iter(generated_texts)
+        protection_iterator = iter(batch_protections)
         outcomes: list[InferenceOutcome] = []
         for record in batch:
             try:
-                extract_raw_text(record)
+                raw_text = extract_raw_text(record)
             except PostprocessError:
                 outcomes.append(
                     InferenceOutcome(
@@ -254,7 +290,20 @@ def run(config: RunConfig) -> int:
                     )
                 )
             else:
-                outcomes.append(InferenceOutcome(next(generated_iterator), latency_ms, None))
+                protection = next(protection_iterator)
+                refined_text = next(generated_iterator)
+                outcomes.append(
+                    InferenceOutcome(
+                        refined_text,
+                        latency_ms,
+                        None,
+                        refiner_accepted=True,
+                        refiner_reject_reasons=(),
+                        protected_entities=tuple(
+                            span.public_dict() for span in protection.spans
+                        ),
+                    )
+                )
         _append_records(
             config.output_path,
             [build_result_record(record, outcome) for record, outcome in zip(batch, outcomes)],
