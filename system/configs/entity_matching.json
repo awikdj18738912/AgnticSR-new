@@ -1,0 +1,24 @@
+{
+  "version": 1,
+  "weights": {
+    "pinyin": 0.55,
+    "character": 0.25,
+    "length": 0.10,
+    "domain": 0.08,
+    "priority": 0.02
+  },
+  "thresholds": {
+    "hint_score": 0.80,
+    "auto_score": 0.80,
+    "auto_min_pinyin": 0.88,
+    "auto_min_margin": 0.12
+  },
+  "limits": {
+    "max_entities": 5000,
+    "max_candidates_per_span": 3,
+    "max_logged_candidates_per_segment": 20,
+    "max_refiner_hints": 16
+  },
+  "auto_entity_types": ["TERM", "PROJECT", "MODEL"],
+  "high_risk_entity_types": ["PERSON", "ORG"]
+}

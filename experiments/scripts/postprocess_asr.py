@@ -28,12 +28,27 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from system.entity_store import EntityStore
-from system.protection import EntityProtector, ProtectionResult
+from system.entity_matcher import EntityCandidateMatcher, EntityFuzzyMode
+from system.entity_pipeline import (
+    PreparedEntitySegment,
+    finalize_entity_segment,
+    has_placeholder_failure,
+    has_retryable_integrity_failure,
+    prepare_entity_segment,
+)
+from system.protection import EntityProtector
 
 SYSTEM_PROMPT = (
     "你是 ASR 文本纠错助手。保留原意，最小修改：去口癖/重复，修错字，补必要标点，"
     "规范数字、日期、术语和代码符号，处理自我修正。不要总结、扩写或解释。"
     "重要易错实体在末尾追加 <KEY>[词1、词2]；没有则不加。"
+    "输入中形如 __ENTITY_000__ 的内容是不可编辑的受保护标记；"
+    "每个标记必须原样保留一次，不得删除、改写、重复或调整顺序。"
+)
+STRICT_PLACEHOLDER_PROMPT = (
+    "最高优先级：完整保留输入中的每个句子和信息，不得总结、缩写、"
+    "合并或删除内容。先逐字复制所有 __ENTITY_NNN__ 标记到对应位置，"
+    "再仅修正其他文字的错字和标点。任何标记都不能省略或改变。"
 )
 Conversation: TypeAlias = list[dict[str, str]]
 
@@ -59,16 +74,40 @@ class RunConfig:
     overwrite: bool
     validate_only: bool
     entity_db: Path | None
+    entity_domain: str
+    entity_fuzzy_mode: str
     model: ModelConfig
 
 
-def build_conversations(raw_texts: list[str]) -> list[Conversation]:
+def build_conversations(
+    raw_texts: list[str],
+    entity_hints: list[tuple[str, ...]] | None = None,
+    *,
+    strict_placeholders: bool = False,
+) -> list[Conversation]:
+    hints_by_text = entity_hints or [() for _ in raw_texts]
+    if len(hints_by_text) != len(raw_texts):
+        raise ValueError("entity_hints must align with raw_texts")
     return [
         [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": raw_text},
+            {
+                "role": "system",
+                "content": (
+                    f"{SYSTEM_PROMPT}{STRICT_PLACEHOLDER_PROMPT}"
+                    if strict_placeholders
+                    else SYSTEM_PROMPT
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"{raw_text}\n<KEY>[{'、'.join(hints[:16])}]"
+                    if hints
+                    else raw_text
+                ),
+            },
         ]
-        for raw_text in raw_texts
+        for raw_text, hints in zip(raw_texts, hints_by_text)
     ]
 
 
@@ -99,8 +138,18 @@ class TransformersPostprocessor:
         template = self._tokenizer.get_chat_template()
         self._template_kwargs = thinking_template_kwargs(template)
 
-    def generate(self, raw_texts: list[str]) -> tuple[list[str], float]:
-        conversations = build_conversations(raw_texts)
+    def generate(
+        self,
+        raw_texts: list[str],
+        entity_hints: list[tuple[str, ...]] | None = None,
+        *,
+        strict_placeholders: bool = False,
+    ) -> tuple[list[str], float]:
+        conversations = build_conversations(
+            raw_texts,
+            entity_hints,
+            strict_placeholders=strict_placeholders,
+        )
         inputs = self._tokenizer.apply_chat_template(
             conversations,
             tokenize=True,
@@ -162,6 +211,12 @@ def parse_args() -> RunConfig:
         type=Path,
         help="optional SQLite database containing verified protected entities",
     )
+    parser.add_argument("--entity-domain", default="general")
+    parser.add_argument(
+        "--entity-fuzzy-mode",
+        choices=[mode.value for mode in EntityFuzzyMode],
+        default="shadow",
+    )
     args = parser.parse_args()
     if args.batch_size < 1:
         parser.error("--batch-size must be at least 1")
@@ -169,6 +224,8 @@ def parse_args() -> RunConfig:
         parser.error("--max-new-tokens must be at least 1")
     if args.limit is not None and args.limit < 1:
         parser.error("--limit must be at least 1")
+    if not args.entity_domain.strip():
+        parser.error("--entity-domain must not be empty")
     return RunConfig(
         input_path=args.input_jsonl.resolve(),
         output_path=args.output_jsonl.resolve(),
@@ -177,6 +234,8 @@ def parse_args() -> RunConfig:
         overwrite=args.overwrite,
         validate_only=args.validate_only,
         entity_db=args.entity_db.resolve() if args.entity_db else None,
+        entity_domain=args.entity_domain.strip(),
+        entity_fuzzy_mode=args.entity_fuzzy_mode,
         model=ModelConfig(
             model_path=args.model,
             device_map=args.device_map,
@@ -246,24 +305,41 @@ def run(config: RunConfig) -> int:
         print("No pending records.")
         return 0
     definitions = (
-        EntityStore(config.entity_db).list_entities()
+        EntityStore(config.entity_db).list_entities(domain=config.entity_domain)
         if config.entity_db is not None
         else ()
     )
     protector = EntityProtector(definitions)
+    fuzzy_mode = EntityFuzzyMode.parse(config.entity_fuzzy_mode)
+    matcher = (
+        EntityCandidateMatcher(
+            definitions,
+            selected_domain=config.entity_domain,
+            mode=fuzzy_mode,
+        )
+        if definitions and fuzzy_mode is not EntityFuzzyMode.OFF
+        else None
+    )
     processor = TransformersPostprocessor(config.model) if valid_records else None
     for offset in range(0, len(pending), config.batch_size):
         batch = pending[offset : offset + config.batch_size]
         batch_inputs: list[str] = []
-        batch_protections: list[ProtectionResult] = []
+        batch_hints: list[tuple[str, ...]] = []
+        batch_prepared: list[PreparedEntitySegment] = []
         for record in batch:
             try:
                 raw_text = extract_raw_text(record)
             except PostprocessError:
                 continue
-            protection = protector.protect(raw_text)
-            batch_inputs.append(raw_text)
-            batch_protections.append(protection)
+            prepared = prepare_entity_segment(
+                raw_text,
+                protector,
+                matcher,
+                allow_auto=True,
+            )
+            batch_inputs.append(prepared.protection.masked_text)
+            batch_hints.append(prepared.hints)
+            batch_prepared.append(prepared)
         generated_texts: list[str] = []
         latency_ms = 0.0
         if batch_inputs:
@@ -274,9 +350,9 @@ def run(config: RunConfig) -> int:
                 f"({len(batch_inputs)} valid inputs)...",
                 flush=True,
             )
-            generated_texts, latency_ms = processor.generate(batch_inputs)
+            generated_texts, latency_ms = processor.generate(batch_inputs, batch_hints)
         generated_iterator = iter(generated_texts)
-        protection_iterator = iter(batch_protections)
+        prepared_iterator = iter(batch_prepared)
         outcomes: list[InferenceOutcome] = []
         for record in batch:
             try:
@@ -290,18 +366,63 @@ def run(config: RunConfig) -> int:
                     )
                 )
             else:
-                protection = next(protection_iterator)
+                prepared = next(prepared_iterator)
                 refined_text = next(generated_iterator)
+                refiner_masked_outputs = [refined_text]
+                finalized = finalize_entity_segment(
+                    refined_text, prepared, protector
+                )
+                sample_latency_ms = latency_ms
+                placeholder_retry_count = 0
+                refiner_retry_count = 0
+                refiner_retry_reasons: tuple[str, ...] = ()
+                if has_retryable_integrity_failure(finalized.reject_reasons):
+                    refiner_retry_reasons = finalized.reject_reasons
+                    placeholder_failed = has_placeholder_failure(
+                        finalized.reject_reasons
+                    )
+                    retry_texts, retry_latency_ms = processor.generate(
+                        [prepared.protection.masked_text],
+                        [prepared.hints],
+                        strict_placeholders=True,
+                    )
+                    refined_text = retry_texts[0]
+                    refiner_masked_outputs.append(refined_text)
+                    sample_latency_ms += retry_latency_ms
+                    refiner_retry_count = 1
+                    placeholder_retry_count = int(placeholder_failed)
+                    finalized = finalize_entity_segment(
+                        refined_text, prepared, protector
+                    )
                 outcomes.append(
                     InferenceOutcome(
-                        refined_text,
-                        latency_ms,
+                        finalized.text,
+                        sample_latency_ms,
                         None,
-                        refiner_accepted=True,
-                        refiner_reject_reasons=(),
+                        refiner_accepted=finalized.accepted,
+                        refiner_reject_reasons=finalized.reject_reasons,
                         protected_entities=tuple(
-                            span.public_dict() for span in protection.spans
+                            span.public_dict() for span in prepared.protection.spans
                         ),
+                        entity_candidates=tuple(
+                            match.public_dict() for match in prepared.report.matches
+                        ),
+                        entity_normalizations=prepared.normalizations,
+                        entity_refinement_hints=prepared.hints,
+                        entity_audit_issues=protector.audit_unmasked(
+                            finalized.text, prepared.protection
+                        ),
+                        entity_matcher_latency_ms=round(
+                            prepared.report.matcher_latency_ms, 3
+                        ),
+                        entity_fuzzy_mode=fuzzy_mode.value,
+                        entity_matching_config_version=(
+                            matcher.config.version if matcher is not None else None
+                        ),
+                        placeholder_retry_count=placeholder_retry_count,
+                        refiner_retry_count=refiner_retry_count,
+                        refiner_retry_reasons=refiner_retry_reasons,
+                        refiner_masked_outputs=tuple(refiner_masked_outputs),
                     )
                 )
         _append_records(

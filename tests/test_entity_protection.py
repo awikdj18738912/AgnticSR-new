@@ -102,7 +102,7 @@ class EntityProtectorTest(unittest.TestCase):
         protector = EntityProtector()
         protection = protector.protect("版本是2.0。")
         restored = protector.restore(
-            f"{protection.masked_text} ⟦P999⟧", protection
+            f"{protection.masked_text} __ENTITY_999__", protection
         )
         self.assertFalse(restored.accepted)
         self.assertTrue(
@@ -115,9 +115,9 @@ class EntityProtectorTest(unittest.TestCase):
         self.assertEqual(len(protection.spans), 2)
 
         reordered = (
-            protection.masked_text.replace("⟦P000⟧", "__TEMP__")
-            .replace("⟦P001⟧", "⟦P000⟧")
-            .replace("__TEMP__", "⟦P001⟧")
+            protection.masked_text.replace("__ENTITY_000__", "__TEMP__")
+            .replace("__ENTITY_001__", "__ENTITY_000__")
+            .replace("__TEMP__", "__ENTITY_001__")
         )
         restored = protector.restore(reordered, protection)
         self.assertFalse(restored.accepted)

@@ -411,6 +411,7 @@
       refinementList.innerHTML = refinementHistory.map((entry, index) => {
         const notes = [];
         if (entry.entityChanges.length) notes.push(...entry.entityChanges.map(change => `<span class="entity-change">实体规范：${escapeHtml(change.observed)} → ${escapeHtml(change.canonical)}</span>`));
+        if (entry.entityCandidates.length) notes.push(`<details><summary>实体候选 ${entry.entityCandidates.length} 条（Matcher ${entry.matcherLatency} ms）</summary>${entry.entityCandidates.map(candidate => `<span>${escapeHtml(candidate.observed)} → ${escapeHtml(candidate.canonical)} · 拼音 ${Number(candidate.pinyin_score || 0).toFixed(2)} / 字符 ${Number(candidate.char_score || 0).toFixed(2)} / 总分 ${Number(candidate.final_score || 0).toFixed(3)} / 间隔 ${candidate.margin == null ? '—' : Number(candidate.margin).toFixed(3)} · ${escapeHtml(candidate.decision)}</span>`).join('')}</details>`);
         if (entry.entityHints.length) notes.push(`<span>术语提示：${escapeHtml(entry.entityHints.join('、'))}</span>`);
         if (entry.detectedEntities.length) notes.push(`<span>命中实体：${escapeHtml(entry.detectedEntities.join('、'))}</span>`);
         if (entry.auditIssues.length) notes.push(`<span class="audit-note">审计提示：${escapeHtml(entry.auditIssues.join('、'))}</span>`);
@@ -451,7 +452,13 @@
         seenRefinementChanges.add(key);
         return true;
       });
-      if (!changes.length && !entityChanges.length && !rejectReasons.length) {
+      const entityCandidates = (Array.isArray(data.entity_candidates) ? data.entity_candidates : []).filter(candidate => {
+        const key = `candidate:${candidate.start}:${candidate.end}:${candidate.entity_id}:${candidate.decision}`;
+        if (seenRefinementChanges.has(key)) return false;
+        seenRefinementChanges.add(key);
+        return true;
+      });
+      if (!changes.length && !entityChanges.length && !rejectReasons.length && !entityCandidates.length) {
         if (data.event === 'final' && refinementHistory.length) {
           refinementHistory[refinementHistory.length - 1].final = true;
           refinementHistory[refinementHistory.length - 1].stage = refinementStageLabel(data);
@@ -467,7 +474,9 @@
         time: new Date().toLocaleTimeString('zh-CN', { hour12: false }),
         entityHints: Array.isArray(data.entity_refinement_hints) ? data.entity_refinement_hints : [],
         entityChanges,
-        detectedEntities: entities.filter(entity => String(entity.source || '').startsWith('database:')).map(entity => `${entity.original}（${entity.replacement}）`),
+        entityCandidates,
+        matcherLatency: Number(data.entity_matcher_latency_ms || 0).toFixed(3),
+        detectedEntities: entities.filter(entity => /^(database|fuzzy):/.test(String(entity.source || ''))).map(entity => `${entity.original}（${entity.replacement}）`),
         auditIssues: Array.isArray(data.entity_audit_issues) ? data.entity_audit_issues : [],
         rejectReasons,
       });

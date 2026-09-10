@@ -135,8 +135,12 @@ python -m system.manage_entities --db data/entities.db list
 ```
 
 `preserve` keeps the exact matched surface. `normalize` restores the verified
-canonical spelling when an explicit alias is matched. Fuzzy matches never
-replace text automatically.
+canonical spelling when an explicit alias is matched. Fuzzy matching has four
+server modes: `off`, `shadow`, `hint`, and `auto`. The default is `shadow`,
+which records candidates without changing output. `auto` only normalizes
+high-confidence `TERM`, `PROJECT`, and `MODEL` matches in a completed
+transcript; streaming intermediate updates and high-risk `PERSON`/`ORG`
+matches are never fuzzy-auto-replaced.
 
 Enable the database in the browser frontend:
 
@@ -147,6 +151,7 @@ CUDA_VISIBLE_DEVICES=1 conda run --no-capture-output -n agentic-asr \
   --refiner-device cuda:0 \
   --asr-url http://127.0.0.1:8766 \
   --entity-db data/entities.db \
+  --entity-fuzzy-mode shadow \
   --output results/web/session.jsonl \
   --port 8081
 ```
@@ -201,8 +206,15 @@ python -m system.live_qwen_refiner \
   --refiner-model /path/to/AgenticASR-Refiner \
   --refiner-device cuda:1 \
   --entity-db data/entities.db \
+  --entity-domain general \
+  --entity-fuzzy-mode shadow \
   --output results/live/session.jsonl
 ```
+
+After reviewing shadow candidates in the JSONL output, use
+`--entity-fuzzy-mode auto` to enable deterministic final-utterance
+normalization. Candidate scores, decisions, reasons, matcher latency, and
+applied normalizations are included in each output record.
 
 The client uses local energy VAD and submits one completed utterance after a
 short silence. It prints raw and refined text, and optionally records each

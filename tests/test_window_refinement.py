@@ -10,7 +10,9 @@ class WindowTest(unittest.TestCase):
             return dict(raw_text=text, clean_text=text.replace('苹果', '梨'),
                         refiner_latency_ms=1, refiner_accepted=True,
                         refiner_reject_reasons=[], entity_audit_issues=[],
-                        entity_refinement_hints=[], entity_normalizations=[], protected_entities=[])
+                        entity_refinement_hints=[], entity_normalizations=[],
+                        protected_entities=[], entity_candidates=[],
+                        entity_matcher_latency_ms=0)
         self.session = CumulativeWindowRefinement(refine)
 
     def update(self, text, final=False):

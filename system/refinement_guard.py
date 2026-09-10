@@ -10,6 +10,8 @@ from collections.abc import Iterable
 _SENTENCE_ENDINGS = frozenset("。！？!?；;\n")
 _SOFT_BREAKS = frozenset("，、：:）)】] ")
 _SENTENCE_RE = re.compile(r"[^。！？!?；;\n]+[。！？!?；;\n]?")
+_SEVERE_LOSS_MIN_SOURCE_CHARS = 80
+_SEVERE_LOSS_MIN_LENGTH_RATIO = 0.65
 
 
 def split_for_refinement(text: str, *, max_chars: int = 200) -> tuple[str, ...]:
@@ -77,6 +79,16 @@ def reject_reasons(raw_text: str, refined_text: str) -> tuple[str, ...]:
     repeated_phrase = re.search(r"(.{8,80}?)(?:\1){2,}", refined)
     if repeated_phrase and repeated_phrase.group(1) not in raw:
         reasons.append("repeated_phrase")
+
+    # A fluent, punctuated hallucination can still replace most of a source
+    # window with one short sentence. Do not let final punctuation bypass the
+    # completeness guard. This conservative floor still permits substantial
+    # filler and repetition cleanup.
+    if (
+        len(raw) >= _SEVERE_LOSS_MIN_SOURCE_CHARS
+        and len(refined) < len(raw) * _SEVERE_LOSS_MIN_LENGTH_RATIO
+    ):
+        reasons.append("severe_content_loss")
 
     source_complete = bool(raw) and raw[-1] in _SENTENCE_ENDINGS
     target_complete = bool(refined) and refined[-1] in _SENTENCE_ENDINGS

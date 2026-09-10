@@ -26,6 +26,13 @@ import numpy as np
 
 from .backends import EnergyVad, SAMPLE_RATE, VAD_WINDOW, normalize_cjk
 from .entity_store import EntityStore
+from .entity_matcher import EntityCandidateMatcher, EntityFuzzyMode
+from .entity_pipeline import (
+    finalize_entity_segment,
+    has_placeholder_failure,
+    has_retryable_integrity_failure,
+    prepare_entity_segment,
+)
 from .protection import EntityProtector
 from .session_memory import SessionEntityMemory
 
@@ -34,6 +41,14 @@ SYSTEM_PROMPT = (
     "规范数字、日期、术语和代码符号，处理自我修正。不要总结、扩写或解释。"
     "输入末尾的 <KEY>[词1、词2] 是已验证术语表；仅在原文已出现对应名称或别名时"
     "使用它来纠错或规范为标准名称，不得据此添加原文未提及的实体，也不要在输出中保留 <KEY>。"
+    "输入中形如 __ENTITY_000__ 的内容是不可编辑的受保护标记；"
+    "每个标记必须在输出中原样保留一次，不得删除、改写、重复或调整顺序。"
+)
+
+STRICT_PLACEHOLDER_PROMPT = (
+    "最高优先级：完整保留输入中的每个句子和信息，不得总结、缩写、"
+    "合并或删除内容。先逐字复制所有 __ENTITY_NNN__ 标记到对应位置，"
+    "再仅修正其他文字的错字和标点。任何标记都不能省略或改变。"
 )
 
 
@@ -68,14 +83,25 @@ class TransformersRefiner:
         )
 
     def refine(
-        self, raw_text: str, *, entity_hints: Iterable[str] = ()
+        self,
+        raw_text: str,
+        *,
+        entity_hints: Iterable[str] = (),
+        strict_placeholders: bool = False,
     ) -> tuple[str, float]:
         hints = tuple(dict.fromkeys(item.strip() for item in entity_hints if item.strip()))
         user_content = raw_text
         if hints:
             user_content = f"{raw_text}\n<KEY>[{'、'.join(hints[:16])}]"
         messages = [
-            {"role": "system", "content": SYSTEM_PROMPT},
+            {
+                "role": "system",
+                "content": (
+                    f"{SYSTEM_PROMPT}{STRICT_PLACEHOLDER_PROMPT}"
+                    if strict_placeholders
+                    else SYSTEM_PROMPT
+                ),
+            },
             {"role": "user", "content": user_content},
         ]
         inputs = self._tokenizer.apply_chat_template(
@@ -175,6 +201,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=Path,
         help="optional SQLite database containing verified protected entities",
     )
+    parser.add_argument(
+        "--entity-domain",
+        default="general",
+        help="load this entity domain plus general",
+    )
+    parser.add_argument(
+        "--entity-fuzzy-mode",
+        choices=[mode.value for mode in EntityFuzzyMode],
+        default="shadow",
+        help="off, shadow, hint, or automatic normalization for complete utterances",
+    )
     args = parser.parse_args(argv)
     if args.preroll < 0 or args.asr_timeout <= 0:
         parser.error("--preroll must be non-negative and --asr-timeout must be positive")
@@ -182,6 +219,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("VAD durations must be positive")
     if args.refiner_max_new_tokens < 1:
         parser.error("--refiner-max-new-tokens must be at least 1")
+    if not args.entity_domain.strip():
+        parser.error("--entity-domain must not be empty")
     if not args.list_devices and args.refiner_model is None:
         parser.error("--refiner-model is required for transcription")
     return args
@@ -204,7 +243,7 @@ def main(argv: list[str] | None = None) -> int:
     memory = SessionEntityMemory()
     if args.entity_db is not None:
         entity_store = EntityStore(args.entity_db.resolve())
-        entity_definitions = entity_store.list_entities()
+        entity_definitions = entity_store.list_entities(domain=args.entity_domain.strip())
         print(
             f"Loaded {len(entity_definitions)} protected entities from "
             f"{args.entity_db.resolve()}",
@@ -213,6 +252,16 @@ def main(argv: list[str] | None = None) -> int:
     else:
         entity_definitions = ()
     protector = EntityProtector(entity_definitions, session_memory=memory)
+    fuzzy_mode = EntityFuzzyMode.parse(args.entity_fuzzy_mode)
+    matcher = (
+        EntityCandidateMatcher(
+            entity_definitions,
+            selected_domain=args.entity_domain.strip(),
+            mode=fuzzy_mode,
+        )
+        if entity_definitions and fuzzy_mode is not EntityFuzzyMode.OFF
+        else None
+    )
     print(f"Using Qwen3-ASR service at {args.asr_url}")
     print("Listening. Press Ctrl+C to stop.", flush=True)
 
@@ -231,18 +280,54 @@ def main(argv: list[str] | None = None) -> int:
         raw_text = normalize_cjk(raw_text).strip()
         if not raw_text:
             return
-        protection = protector.protect(raw_text)
+        prepared = prepare_entity_segment(
+            raw_text,
+            protector,
+            matcher,
+            allow_auto=True,
+        )
+        protection = prepared.protection
         refined_text, latency_ms = refiner.refine(
-            raw_text, entity_hints=protector.refinement_hints(protection)
+            protection.masked_text, entity_hints=prepared.hints
         )
-        refined_text, entity_normalizations = protector.normalize_verified_aliases(
-            refined_text, protection
+        refiner_masked_outputs = [refined_text]
+        finalized = finalize_entity_segment(
+            refined_text, prepared, protector
         )
+        placeholder_retry_count = 0
+        refiner_retry_count = 0
+        refiner_retry_reasons: tuple[str, ...] = ()
+        if has_retryable_integrity_failure(finalized.reject_reasons):
+            refiner_retry_reasons = finalized.reject_reasons
+            placeholder_failed = has_placeholder_failure(finalized.reject_reasons)
+            refined_text, retry_latency_ms = refiner.refine(
+                protection.masked_text,
+                entity_hints=prepared.hints,
+                strict_placeholders=True,
+            )
+            latency_ms += retry_latency_ms
+            refiner_retry_count = 1
+            placeholder_retry_count = int(placeholder_failed)
+            refiner_masked_outputs.append(refined_text)
+            finalized = finalize_entity_segment(refined_text, prepared, protector)
+        refined_text = finalized.text
+        entity_normalizations = prepared.normalizations
         entity_audit_issues = protector.audit_unmasked(refined_text, protection)
         print(f"[raw] {raw_text}")
         print(f"[refined {latency_ms:.0f}ms] {refined_text}", flush=True)
+        if refiner_retry_count:
+            print(
+                "[refinement guard] retried: " + ", ".join(refiner_retry_reasons),
+                flush=True,
+            )
         if entity_audit_issues:
             print(f"[entity audit] {', '.join(entity_audit_issues)}", flush=True)
+        for match in prepared.report.auto_matches:
+            print(
+                f"[entity auto {match.final_score:.3f}] "
+                f"{match.observed} -> {match.canonical}",
+                flush=True,
+            )
         if args.output:
             _append_record(
                 args.output.resolve(),
@@ -254,13 +339,27 @@ def main(argv: list[str] | None = None) -> int:
                         "raw_text": raw_text,
                         "clean_text": refined_text,
                         "llm_latency_ms": latency_ms,
-                        "refiner_accepted": True,
-                        "refiner_reject_reasons": [],
+                        "refiner_accepted": finalized.accepted,
+                        "refiner_reject_reasons": list(finalized.reject_reasons),
+                        "placeholder_retry_count": placeholder_retry_count,
+                        "refiner_retry_count": refiner_retry_count,
+                        "refiner_retry_reasons": list(refiner_retry_reasons),
+                        "refiner_masked_outputs": refiner_masked_outputs,
                         "entity_audit_issues": list(entity_audit_issues),
                         "entity_normalizations": list(entity_normalizations),
                         "protected_entities": [
                             span.public_dict() for span in protection.spans
                         ],
+                        "entity_candidates": [
+                            match.public_dict() for match in prepared.report.matches
+                        ],
+                        "entity_matcher_latency_ms": round(
+                            prepared.report.matcher_latency_ms, 3
+                        ),
+                        "entity_fuzzy_mode": fuzzy_mode.value,
+                        "entity_matching_config_version": (
+                            matcher.config.version if matcher is not None else None
+                        ),
                     },
                 },
             )

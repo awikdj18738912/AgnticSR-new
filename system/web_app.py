@@ -21,8 +21,15 @@ import uvicorn
 
 from .live_qwen_refiner import TransformersRefiner, _append_record
 from .entity_store import EntityDefinition, EntityStore
+from .entity_matcher import EntityCandidateMatcher, EntityFuzzyMode
+from .entity_pipeline import (
+    finalize_entity_segment,
+    has_placeholder_failure,
+    has_retryable_integrity_failure,
+    prepare_entity_segment,
+)
 from .protection import EntityProtector
-from .refinement_guard import join_refined_segments, reject_reasons, split_for_refinement
+from .refinement_guard import join_refined_segments, split_for_refinement
 from .window_refinement import CumulativeWindowRefinement
 from .session_memory import SessionEntityMemory
 
@@ -140,12 +147,14 @@ def create_app(
     max_new_tokens: int,
     output: Path | None,
     entity_db: Path | None = None,
+    entity_fuzzy_mode: str = "shadow",
 ) -> FastAPI:
     app = FastAPI(docs_url=None, redoc_url=None)
     print("Loading AgenticASR Refiner...", flush=True)
     refiner = TransformersRefiner(refiner_model, refiner_device, max_new_tokens)
     refiner_lock = threading.Lock()
     entity_store = EntityStore(entity_db) if entity_db is not None else None
+    fuzzy_mode = EntityFuzzyMode.parse(entity_fuzzy_mode)
 
     def managed_entity_store() -> EntityStore:
         if entity_store is None:
@@ -161,6 +170,7 @@ def create_app(
         final: bool,
         protector: EntityProtector,
         asr_confidence: float | None,
+        matcher: EntityCandidateMatcher | None = None,
         *, single_window: bool = False,
     ) -> dict[str, object]:
         clean_parts: list[str] = []
@@ -168,13 +178,26 @@ def create_app(
         entity_hints: list[str] = []
         entity_normalizations: list[dict[str, str]] = []
         entity_audit_issues: list[str] = []
+        entity_candidates: list[dict[str, object]] = []
         refiner_reject_reasons: list[str] = []
+        refiner_masked_outputs: list[str] = []
+        placeholder_retry_count = 0
+        refiner_retry_count = 0
+        refiner_retry_reasons: list[str] = []
         total_latency_ms = 0.0
+        matcher_latency_ms = 0.0
         refiner_available = True
         segments = (raw_text,) if single_window and raw_text else split_for_refinement(raw_text)
         for segment_index, segment in enumerate(segments):
-            protection = protector.protect(segment, confidence=asr_confidence)
-            hints = protector.refinement_hints(protection)
+            prepared = prepare_entity_segment(
+                segment,
+                protector,
+                matcher,
+                allow_auto=final,
+                confidence=asr_confidence,
+            )
+            protection = prepared.protection
+            hints = prepared.hints
             # A stale browser connection must not be able to block the final
             # result forever.  After one timeout, preserve all remaining source
             # segments and report the quality fallback in the response.
@@ -184,33 +207,57 @@ def create_app(
             )
             if not lock_acquired:
                 refiner_available = False
-                clean_segment = segment
-                changes = []
+                clean_segment = prepared.baseline_text
+                changes = list(prepared.normalizations)
                 refiner_reject_reasons.append(
                     f"segment_{segment_index + 1}:refiner_busy"
                 )
             else:
                 try:
                     refined_candidate, latency_ms = refiner.refine(
-                        segment, entity_hints=hints
+                        protection.masked_text, entity_hints=hints
                     )
+                    total_latency_ms += latency_ms
+                    refiner_masked_outputs.append(refined_candidate)
+                    finalized = finalize_entity_segment(
+                        refined_candidate, prepared, protector
+                    )
+                    if has_retryable_integrity_failure(finalized.reject_reasons):
+                        initial_reasons = finalized.reject_reasons
+                        retry_candidate, retry_latency_ms = refiner.refine(
+                            protection.masked_text,
+                            entity_hints=hints,
+                            strict_placeholders=True,
+                        )
+                        refiner_retry_count += 1
+                        if has_placeholder_failure(initial_reasons):
+                            placeholder_retry_count += 1
+                        refiner_retry_reasons.extend(
+                            f"segment_{segment_index + 1}:{reason}"
+                            for reason in initial_reasons
+                        )
+                        total_latency_ms += retry_latency_ms
+                        refiner_masked_outputs.append(retry_candidate)
+                        finalized = finalize_entity_segment(
+                            retry_candidate, prepared, protector
+                        )
                 finally:
                     refiner_lock.release()
-                total_latency_ms += latency_ms
-                clean_segment, changes = protector.normalize_verified_aliases(
-                    refined_candidate, protection
-                )
-                segment_reasons = reject_reasons(segment, clean_segment)
-                if segment_reasons:
-                    clean_segment = segment
+                clean_segment = finalized.text
+                changes = list(prepared.normalizations)
+                if finalized.reject_reasons:
                     refiner_reject_reasons.extend(
                         f"segment_{segment_index + 1}:{reason}"
-                        for reason in segment_reasons
+                        for reason in finalized.reject_reasons
                     )
             clean_parts.append(clean_segment)
             protected_entities.extend(span.public_dict() for span in protection.spans)
             entity_hints.extend(hints)
             entity_normalizations.extend(changes)
+            entity_candidates.extend(
+                match.public_dict() for match in prepared.report.matches
+            )
+            matcher_latency_ms += prepared.report.matcher_latency_ms
             entity_audit_issues.extend(protector.audit_unmasked(clean_segment, protection))
         clean_text = join_refined_segments(clean_parts)
         return {
@@ -222,10 +269,20 @@ def create_app(
             "refiner_latency_ms": round(total_latency_ms),
             "refiner_accepted": not refiner_reject_reasons,
             "refiner_reject_reasons": refiner_reject_reasons,
+            "placeholder_retry_count": placeholder_retry_count,
+            "refiner_retry_count": refiner_retry_count,
+            "refiner_retry_reasons": refiner_retry_reasons,
+            "refiner_masked_outputs": refiner_masked_outputs,
             "entity_audit_issues": list(dict.fromkeys(entity_audit_issues)),
             "entity_refinement_hints": list(dict.fromkeys(entity_hints)),
             "entity_normalizations": entity_normalizations,
             "protected_entities": protected_entities,
+            "entity_candidates": entity_candidates,
+            "entity_matcher_latency_ms": round(matcher_latency_ms, 3),
+            "entity_fuzzy_mode": fuzzy_mode.value,
+            "entity_matching_config_version": (
+                matcher.config.version if matcher is not None else None
+            ),
         }
 
     def fallback_update(
@@ -233,6 +290,7 @@ def create_app(
         detected_language: str | None,
         protector: EntityProtector,
         asr_confidence: float | None,
+        matcher: EntityCandidateMatcher | None,
         reason: str,
         started_at: float,
     ) -> dict[str, object]:
@@ -243,14 +301,28 @@ def create_app(
         entity_hints: list[str] = []
         entity_normalizations: list[dict[str, str]] = []
         entity_audit_issues: list[str] = []
+        entity_candidates: list[dict[str, object]] = []
+        matcher_latency_ms = 0.0
         for segment in split_for_refinement(raw_text):
-            protection = protector.protect(segment, confidence=asr_confidence)
-            clean_segment, changes = protector.normalize_verified_aliases(segment, protection)
-            clean_parts.append(clean_segment)
+            prepared = prepare_entity_segment(
+                segment,
+                protector,
+                matcher,
+                allow_auto=True,
+                confidence=asr_confidence,
+            )
+            protection = prepared.protection
+            clean_parts.append(prepared.baseline_text)
             protected_entities.extend(span.public_dict() for span in protection.spans)
-            entity_hints.extend(protector.refinement_hints(protection))
-            entity_normalizations.extend(changes)
-            entity_audit_issues.extend(protector.audit_unmasked(clean_segment, protection))
+            entity_hints.extend(prepared.hints)
+            entity_normalizations.extend(prepared.normalizations)
+            entity_candidates.extend(
+                match.public_dict() for match in prepared.report.matches
+            )
+            matcher_latency_ms += prepared.report.matcher_latency_ms
+            entity_audit_issues.extend(
+                protector.audit_unmasked(prepared.baseline_text, protection)
+            )
         return {
             "event": "final",
             "raw_text": raw_text,
@@ -260,10 +332,20 @@ def create_app(
             "refiner_latency_ms": round((time.perf_counter() - started_at) * 1000),
             "refiner_accepted": False,
             "refiner_reject_reasons": [reason],
+            "placeholder_retry_count": 0,
+            "refiner_retry_count": 0,
+            "refiner_retry_reasons": [],
+            "refiner_masked_outputs": [],
             "entity_audit_issues": list(dict.fromkeys(entity_audit_issues)),
             "entity_refinement_hints": list(dict.fromkeys(entity_hints)),
             "entity_normalizations": entity_normalizations,
             "protected_entities": protected_entities,
+            "entity_candidates": entity_candidates,
+            "entity_matcher_latency_ms": round(matcher_latency_ms, 3),
+            "entity_fuzzy_mode": fuzzy_mode.value,
+            "entity_matching_config_version": (
+                matcher.config.version if matcher is not None else None
+            ),
         }
 
     @app.get("/")
@@ -399,6 +481,15 @@ def create_app(
             else ()
         )
         protector = EntityProtector(definitions, session_memory=session_memory)
+        matcher = (
+            EntityCandidateMatcher(
+                definitions,
+                selected_domain=requested_domain,
+                mode=fuzzy_mode,
+            )
+            if definitions and fuzzy_mode is not EntityFuzzyMode.OFF
+            else None
+        )
         pending_refinement: tuple[
             str, str | None, float | None, str, int
         ] | None = None
@@ -463,6 +554,7 @@ def create_app(
                         False,
                         protector,
                         confidence_value,
+                        matcher,
                     )
                     if streaming_finish_requested:
                         return
@@ -502,12 +594,13 @@ def create_app(
             started_at = time.perf_counter()
             task = asyncio.create_task(
                 asyncio.to_thread(
-                    window_refinement.update if requested_mode in {"online", "streaming"} else refine_update,
+                    refine_update,
                     raw_text,
                     detected_language,
                     True,
                     protector,
                     asr_confidence,
+                    matcher,
                 )
             )
             loop = asyncio.get_running_loop()
@@ -604,6 +697,7 @@ def create_app(
                                 detected_language if isinstance(detected_language, str) else None,
                                 protector,
                                 asr_confidence,
+                                matcher,
                                 "final_refinement_timeout",
                                 refinement_started,
                             )
@@ -615,6 +709,7 @@ def create_app(
                                 detected_language if isinstance(detected_language, str) else None,
                                 protector,
                                 asr_confidence,
+                                matcher,
                                 f"final_refinement_error:{type(error).__name__}",
                                 refinement_started,
                             )
@@ -635,6 +730,18 @@ def create_app(
                                         "refiner_reject_reasons": result[
                                             "refiner_reject_reasons"
                                         ],
+                                        "placeholder_retry_count": result[
+                                            "placeholder_retry_count"
+                                        ],
+                                        "refiner_retry_count": result[
+                                            "refiner_retry_count"
+                                        ],
+                                        "refiner_retry_reasons": result[
+                                            "refiner_retry_reasons"
+                                        ],
+                                        "refiner_masked_outputs": result[
+                                            "refiner_masked_outputs"
+                                        ],
                                         "entity_audit_issues": result[
                                             "entity_audit_issues"
                                         ],
@@ -646,6 +753,18 @@ def create_app(
                                         ],
                                         "protected_entities": result[
                                             "protected_entities"
+                                        ],
+                                        "entity_candidates": result[
+                                            "entity_candidates"
+                                        ],
+                                        "entity_matcher_latency_ms": result[
+                                            "entity_matcher_latency_ms"
+                                        ],
+                                        "entity_fuzzy_mode": result[
+                                            "entity_fuzzy_mode"
+                                        ],
+                                        "entity_matching_config_version": result[
+                                            "entity_matching_config_version"
                                         ],
                                     },
                                 },
@@ -707,6 +826,7 @@ def create_app(
                                 False,
                                 protector,
                                 asr_confidence,
+                                matcher,
                             )
                         ):
                             break
@@ -751,6 +871,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=Path,
         help="optional SQLite database containing verified protected entities",
     )
+    parser.add_argument(
+        "--entity-fuzzy-mode",
+        choices=[mode.value for mode in EntityFuzzyMode],
+        default="shadow",
+        help="off, shadow, hint, or final-only automatic entity normalization",
+    )
     args = parser.parse_args(argv)
     if not args.refiner_model.exists():
         parser.error(f"Refiner model not found: {args.refiner_model}")
@@ -769,6 +895,7 @@ def main(argv: list[str] | None = None) -> int:
         args.max_new_tokens,
         args.output.resolve() if args.output else None,
         args.entity_db.resolve() if args.entity_db else None,
+        args.entity_fuzzy_mode,
     )
     uvicorn.run(app, host=args.host, port=args.port, log_level="info")
     return 0

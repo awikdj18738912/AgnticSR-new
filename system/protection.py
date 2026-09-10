@@ -5,13 +5,16 @@ from __future__ import annotations
 import re
 import time
 from dataclasses import dataclass
-from typing import Iterable
+from typing import TYPE_CHECKING, Iterable
 
 from .entity_store import EntityDefinition
 from .session_memory import SessionEntityMemory
 
+if TYPE_CHECKING:
+    from .entity_matcher import EntityMatch
 
-_PLACEHOLDER_RE = re.compile(r"⟦P\d{3}⟧")
+
+_PLACEHOLDER_RE = re.compile(r"__ENTITY_\d{3}__")
 _REFINER_KEY_SUFFIX_RE = re.compile(r"\s*<KEY>\[[^\]]*\]\s*$")
 _RULE_PATTERNS: tuple[tuple[str, re.Pattern[str], int], ...] = (
     ("URL", re.compile(r"https?://[^\s，。！？；]+", re.IGNORECASE), 900),
@@ -66,14 +69,22 @@ class ProtectedSpan:
     replacement: str
     entity_type: str
     source: str
+    entity_id: int | None = None
+    match_type: str = "RULE"
+    match_score: float | None = None
+    decision: str = "EXACT"
 
-    def public_dict(self) -> dict[str, str]:
+    def public_dict(self) -> dict[str, object]:
         return {
             "placeholder": self.placeholder,
             "original": self.original,
             "replacement": self.replacement,
             "entity_type": self.entity_type,
             "source": self.source,
+            "entity_id": self.entity_id,
+            "match_type": self.match_type,
+            "match_score": self.match_score,
+            "decision": self.decision,
         }
 
 
@@ -100,6 +111,10 @@ class _Candidate:
     entity_type: str
     source: str
     priority: int
+    entity_id: int | None = None
+    match_type: str = "RULE"
+    match_score: float | None = None
+    decision: str = "EXACT"
 
 
 class EntityProtector:
@@ -120,6 +135,7 @@ class EntityProtector:
         *,
         confidence: float | None = None,
         now_ms: float | None = None,
+        fuzzy_matches: Iterable["EntityMatch"] = (),
     ) -> ProtectionResult:
         observed_at = now_ms if now_ms is not None else time.monotonic() * 1000
         candidates: list[_Candidate] = []
@@ -142,6 +158,14 @@ class EntityProtector:
                             entity_type=definition.entity_type,
                             source=f"database:{definition.domain}",
                             priority=1000 + definition.priority,
+                            entity_id=definition.entity_id,
+                            match_type=(
+                                "EXACT_CANONICAL"
+                                if original.casefold() == definition.canonical_text.casefold()
+                                else "EXACT_ALIAS"
+                            ),
+                            match_score=1.0,
+                            decision="EXACT",
                         )
                     )
                     if self.session_memory is not None:
@@ -169,6 +193,8 @@ class EntityProtector:
                                 entity_type=memory.entity_type,
                                 source=f"session:{memory.trust_level.value}",
                                 priority=950,
+                                match_type="SESSION_EXACT",
+                                match_score=1.0,
                             )
                         )
 
@@ -183,15 +209,54 @@ class EntityProtector:
                         entity_type=entity_type,
                         source="rule",
                         priority=priority,
+                        match_type="RULE",
                     )
                 )
+
+        rule_ranges = tuple(
+            (candidate.start, candidate.end)
+            for candidate in candidates
+            if candidate.source == "rule"
+        )
+        definitions = {definition.entity_id: definition for definition in self.entities}
+        for match in fuzzy_matches:
+            definition = definitions.get(match.entity_id)
+            if (
+                match.decision.value != "AUTO_NORMALIZE"
+                or definition is None
+                or not definition.enabled
+                or definition.normalization_policy != "normalize"
+                or definition.canonical_text != match.canonical
+                or not (0 <= match.start < match.end <= len(text))
+                or text[match.start : match.end] != match.observed
+                or any(
+                    match.start < rule_end and rule_start < match.end
+                    for rule_start, rule_end in rule_ranges
+                )
+            ):
+                continue
+            candidates.append(
+                _Candidate(
+                    start=match.start,
+                    end=match.end,
+                    original=match.observed,
+                    replacement=definition.canonical_text,
+                    entity_type=definition.entity_type,
+                    source=f"fuzzy:{definition.domain}",
+                    priority=980 + definition.priority,
+                    entity_id=definition.entity_id,
+                    match_type=match.match_type,
+                    match_score=match.final_score,
+                    decision=match.decision.value,
+                )
+            )
 
         selected = _select_non_overlapping(candidates)
         spans: list[ProtectedSpan] = []
         parts: list[str] = []
         cursor = 0
         for index, candidate in enumerate(selected):
-            placeholder = f"⟦P{index:03d}⟧"
+            placeholder = f"__ENTITY_{index:03d}__"
             parts.append(text[cursor : candidate.start])
             parts.append(placeholder)
             spans.append(
@@ -203,6 +268,10 @@ class EntityProtector:
                     replacement=candidate.replacement,
                     entity_type=candidate.entity_type,
                     source=candidate.source,
+                    entity_id=candidate.entity_id,
+                    match_type=candidate.match_type,
+                    match_score=candidate.match_score,
+                    decision=candidate.decision,
                 )
             )
             cursor = candidate.end
@@ -210,11 +279,11 @@ class EntityProtector:
         return ProtectionResult(text, "".join(parts), tuple(spans))
 
     def restore(self, refined_text: str, protection: ProtectionResult) -> RestorationResult:
-        output = refined_text.strip()
+        output = _REFINER_KEY_SUFFIX_RE.sub("", refined_text).strip()
         if not output or "<KEY>" in output:
             return RestorationResult(protection.original_text, False, ("empty_or_metadata_output",))
         remainder = _PLACEHOLDER_RE.sub("", output)
-        if "⟦" in remainder or "⟧" in remainder:
+        if "__ENTITY_" in remainder:
             return RestorationResult(protection.original_text, False, ("malformed_placeholder",))
         if not protection.spans:
             return RestorationResult(output, True, ())

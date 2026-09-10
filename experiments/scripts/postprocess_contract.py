@@ -24,6 +24,17 @@ class InferenceOutcome:
     refiner_accepted: bool | None = None
     refiner_reject_reasons: tuple[str, ...] = ()
     protected_entities: tuple[JsonObject, ...] = ()
+    entity_candidates: tuple[JsonObject, ...] = ()
+    entity_normalizations: tuple[JsonObject, ...] = ()
+    entity_refinement_hints: tuple[str, ...] = ()
+    entity_audit_issues: tuple[str, ...] = ()
+    entity_matcher_latency_ms: float = 0.0
+    entity_fuzzy_mode: str = "off"
+    entity_matching_config_version: int | None = None
+    placeholder_retry_count: int = 0
+    refiner_retry_count: int = 0
+    refiner_retry_reasons: tuple[str, ...] = ()
+    refiner_masked_outputs: tuple[str, ...] = ()
 
 
 def _output_object(record: JsonObject) -> JsonObject:
@@ -68,9 +79,20 @@ def build_result_record(source: JsonObject, outcome: InferenceOutcome) -> JsonOb
         "llm_latency_ms": outcome.llm_latency_ms,
         "ok": outcome.error is None,
         "protected_entities": list(outcome.protected_entities),
+        "entity_candidates": list(outcome.entity_candidates),
+        "entity_normalizations": list(outcome.entity_normalizations),
+        "entity_refinement_hints": list(outcome.entity_refinement_hints),
+        "entity_audit_issues": list(outcome.entity_audit_issues),
+        "entity_matcher_latency_ms": outcome.entity_matcher_latency_ms,
+        "entity_fuzzy_mode": outcome.entity_fuzzy_mode,
+        "entity_matching_config_version": outcome.entity_matching_config_version,
         "raw_text": raw_text,
         "refiner_accepted": outcome.refiner_accepted,
         "refiner_reject_reasons": list(outcome.refiner_reject_reasons),
+        "placeholder_retry_count": outcome.placeholder_retry_count,
+        "refiner_retry_count": outcome.refiner_retry_count,
+        "refiner_retry_reasons": list(outcome.refiner_retry_reasons),
+        "refiner_masked_outputs": list(outcome.refiner_masked_outputs),
         "stt_latency_ms": stt_latency,
         "total_latency_ms": total_latency,
     }

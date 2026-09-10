@@ -26,6 +26,16 @@ class RefinementGuardTest(unittest.TestCase):
 
         self.assertIn("truncated_refiner_output", reject_reasons(raw, refined))
 
+    def test_punctuated_severe_content_loss_is_rejected(self) -> None:
+        raw = (
+            "怎么可能？你竟结成了元婴？此青火杖乃墨家的不夜之杖。"
+            "你这手段怎么比我还像我道？我记住你了。你认识这位道友？"
+            "此人就是我与你说过的那个黄风谷姓韩的，放肆！"
+            "韩道友已经是元婴修士，又岂会和你一般见识？"
+        )
+
+        self.assertIn("severe_content_loss", reject_reasons(raw, "你怎么拼？"))
+
     def test_normal_refinement_is_accepted(self) -> None:
         self.assertEqual(
             reject_reasons("今天有一个苹果，不对，有一个梨。", "今天有一个梨。"),
