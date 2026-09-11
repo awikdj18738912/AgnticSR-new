@@ -18,6 +18,13 @@ class CumulativeWindowRefinement:
         self.active = None
         self.lock = Lock()
 
+    @property
+    def has_cached_result(self):
+        """Return whether at least one window refinement has completed."""
+
+        with self.lock:
+            return self.active is not None
+
     def update(self, text, language, final, protector, confidence, matcher=None):
         with self.lock:
             manager = ChunkManager(max_chars=80)

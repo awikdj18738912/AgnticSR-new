@@ -642,7 +642,13 @@
           recordRefinementStep(data);
           updateRefinerStatus(data);
           if (data.event === 'update') {
-            setStatus(selectedMode === 'streaming' ? '离线流式转录与精修中' : '实时识别中');
+            setStatus(
+              selectedMode === 'streaming'
+                ? '离线流式转录与精修中'
+                : selectedMode === 'offline'
+                  ? '离线模式滑动窗口精修中'
+                  : '实时识别中'
+            );
           }
           if (data.event === 'final') completeTranscription('已完成');
         };

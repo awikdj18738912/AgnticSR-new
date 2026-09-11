@@ -15,6 +15,8 @@ if TYPE_CHECKING:
 
 
 _PLACEHOLDER_RE = re.compile(r"__ENTITY_\d{3}__")
+_BARE_PLACEHOLDER_RE = re.compile(r"(?<![A-Za-z0-9_])ENTITY_(\d{3})(?![A-Za-z0-9_])")
+_SENTENCE_BOUNDARY_RE = re.compile(r"[。！？!?；;\n]")
 _REFINER_KEY_SUFFIX_RE = re.compile(r"\s*<KEY>\[[^\]]*\]\s*$")
 _RULE_PATTERNS: tuple[tuple[str, re.Pattern[str], int], ...] = (
     ("URL", re.compile(r"https?://[^\s，。！？；]+", re.IGNORECASE), 900),
@@ -282,6 +284,16 @@ class EntityProtector:
         output = _REFINER_KEY_SUFFIX_RE.sub("", refined_text).strip()
         if not output or "<KEY>" in output:
             return RestorationResult(protection.original_text, False, ("empty_or_metadata_output",))
+        # Only repair the exact bare spelling, never guess IDs or repair
+        # arbitrary malformed markers. Literal source tokens are ambiguous.
+        if protection.spans and _BARE_PLACEHOLDER_RE.search(output):
+            if _BARE_PLACEHOLDER_RE.search(protection.original_text):
+                return RestorationResult(
+                    protection.original_text, False, ("ambiguous_literal_placeholder",)
+                )
+            output = _BARE_PLACEHOLDER_RE.sub(
+                lambda match: f"__ENTITY_{match.group(1)}__", output
+            )
         remainder = _PLACEHOLDER_RE.sub("", output)
         if "__ENTITY_" in remainder:
             return RestorationResult(protection.original_text, False, ("malformed_placeholder",))
@@ -303,6 +315,18 @@ class EntityProtector:
                 positions.append(output.index(placeholder))
         if len(positions) == len(expected) and positions != sorted(positions):
             reasons.append("placeholder_order_changed")
+
+        # Keeping every ID is insufficient: collapsing separate entity-bearing
+        # sentences into a list changes their relationships. Preserve sentence
+        # separation between adjacent entities, including already-valid tokens.
+        if not reasons:
+            for left, right in zip(expected, expected[1:]):
+                source_gap = protection.masked_text.split(left, 1)[1].split(right, 1)[0]
+                output_gap = output.split(left, 1)[1].split(right, 1)[0]
+                if (_SENTENCE_BOUNDARY_RE.search(source_gap)
+                        and not _SENTENCE_BOUNDARY_RE.search(output_gap)):
+                    reasons.append("entity_sentence_boundary_lost")
+                    break
 
         if reasons:
             return RestorationResult(protection.original_text, False, tuple(reasons))

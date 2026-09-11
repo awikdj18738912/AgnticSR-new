@@ -5,16 +5,21 @@ from __future__ import annotations
 import re
 from collections import Counter
 from collections.abc import Iterable
+from difflib import SequenceMatcher
 
 
 _SENTENCE_ENDINGS = frozenset("。！？!?；;\n")
 _SOFT_BREAKS = frozenset("，、：:）)】] ")
 _SENTENCE_RE = re.compile(r"[^。！？!?；;\n]+[。！？!?；;\n]?")
-_SEVERE_LOSS_MIN_SOURCE_CHARS = 80
+DEFAULT_REFINEMENT_MAX_CHARS = 80
+_SEVERE_LOSS_MIN_SOURCE_CHARS = 16
+_SHORT_SEGMENT_MIN_SIMILARITY = 0.35
 _SEVERE_LOSS_MIN_LENGTH_RATIO = 0.65
 
 
-def split_for_refinement(text: str, *, max_chars: int = 200) -> tuple[str, ...]:
+def split_for_refinement(
+    text: str, *, max_chars: int = DEFAULT_REFINEMENT_MAX_CHARS
+) -> tuple[str, ...]:
     """Split text into bounded, punctuation-preferred Refiner windows.
 
     The Refiner has a finite generation budget.  Sending a long meeting
@@ -84,11 +89,13 @@ def reject_reasons(raw_text: str, refined_text: str) -> tuple[str, ...]:
     # window with one short sentence. Do not let final punctuation bypass the
     # completeness guard. This conservative floor still permits substantial
     # filler and repetition cleanup.
-    if (
-        len(raw) >= _SEVERE_LOSS_MIN_SOURCE_CHARS
-        and len(refined) < len(raw) * _SEVERE_LOSS_MIN_LENGTH_RATIO
-    ):
-        reasons.append("severe_content_loss")
+    if len(raw) >= _SEVERE_LOSS_MIN_SOURCE_CHARS:
+        length_ratio = len(refined) / len(raw)
+        similarity = SequenceMatcher(None, raw, refined, autojunk=False).ratio()
+        if length_ratio < _SEVERE_LOSS_MIN_LENGTH_RATIO and (
+            len(raw) >= 24 or similarity < _SHORT_SEGMENT_MIN_SIMILARITY
+        ):
+            reasons.append("severe_content_loss")
 
     source_complete = bool(raw) and raw[-1] in _SENTENCE_ENDINGS
     target_complete = bool(refined) and refined[-1] in _SENTENCE_ENDINGS

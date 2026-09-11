@@ -58,7 +58,7 @@ def has_retryable_integrity_failure(reasons: tuple[str, ...]) -> bool:
     """Return whether a stricter second refinement attempt can recover output."""
 
     return has_placeholder_failure(reasons) or any(
-        reason in {"severe_content_loss", "truncated_refiner_output"}
+        reason in {"severe_content_loss", "truncated_refiner_output", "entity_sentence_boundary_lost"}
         for reason in reasons
     )
 

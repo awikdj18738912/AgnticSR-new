@@ -60,6 +60,23 @@ class _IdentityRefiner:
         return text, 1.0
 
 
+class _CountingRefiner:
+    calls: list[str] = []
+
+    def __init__(self, *args, **kwargs) -> None:
+        type(self).calls = []
+
+    def refine(
+        self,
+        text: str,
+        *,
+        entity_hints: tuple[str, ...] = (),
+        strict_placeholders: bool = False,
+    ) -> tuple[str, float]:
+        type(self).calls.append(text)
+        return text.replace("原始", "精修"), 1.0
+
+
 class _DropsPlaceholderOnceRefiner:
     def __init__(self, *args, **kwargs) -> None:
         pass
@@ -120,6 +137,22 @@ def _slow_chunk_stream_request(
     return _fake_stream_request(asr_url, endpoint, session_id, data, params)
 
 
+def _stable_stream_request(
+    asr_url: str,
+    endpoint: str,
+    session_id: str | None = None,
+    data: bytes = b"",
+    params: dict[str, str] | None = None,
+) -> dict[str, object]:
+    if endpoint == "/stream/start":
+        return {"session_id": "stable-test-session"}
+    if endpoint in {"/stream/chunk", "/stream/finish"}:
+        return {"text": "第一段原始文本。第二段原始文本。", "language": "Chinese"}
+    if endpoint == "/stream/cancel":
+        return {"cancelled": True}
+    raise AssertionError(f"unexpected endpoint: {endpoint}")
+
+
 def _entity_stream_request(
     asr_url: str,
     endpoint: str,
@@ -129,7 +162,7 @@ def _entity_stream_request(
 ) -> dict[str, object]:
     if endpoint == "/stream/start":
         return {"session_id": "entity-test-session"}
-    if endpoint == "/stream/finish":
+    if endpoint in {"/stream/chunk", "/stream/finish"}:
         return {"text": "鬼灵们是这个副本的入口。", "language": "Chinese"}
     if endpoint == "/stream/cancel":
         return {"cancelled": True}
@@ -162,6 +195,123 @@ def _content_loss_stream_request(
 
 @unittest.skipIf(web_app is None, "FastAPI is not installed")
 class WebAppFinishTest(unittest.TestCase):
+    def test_offline_mode_reuses_completed_window_refinement(self) -> None:
+        with (
+            patch.object(web_app, "TransformersRefiner", _CountingRefiner),
+            patch.object(web_app, "_stream_request", _stable_stream_request),
+        ):
+            app = web_app.create_app(
+                Path("/tmp/fake-refiner"),
+                "cpu",
+                "http://fake-asr",
+                "Chinese",
+                32,
+                None,
+            )
+            with TestClient(app) as client:
+                with client.websocket_connect(
+                    "/ws/stream?mode=offline"
+                ) as websocket:
+                    self.assertEqual(websocket.receive_json()["event"], "ready")
+                    websocket.send_bytes(b"pcm")
+                    message = websocket.receive_json()
+                    while message["event"] != "update":
+                        message = websocket.receive_json()
+                    calls_before_finish = len(_CountingRefiner.calls)
+                    self.assertGreater(calls_before_finish, 0)
+
+                    websocket.send_json({"event": "finish"})
+                    self.assertEqual(websocket.receive_json()["event"], "transcript")
+                    final = websocket.receive_json()
+
+                    self.assertEqual(final["event"], "final")
+                    self.assertEqual(
+                        final["clean_text"],
+                        "第一段精修文本。第二段精修文本。",
+                    )
+                    self.assertEqual(len(_CountingRefiner.calls), calls_before_finish)
+
+    def test_streaming_cached_result_still_applies_final_fuzzy_entity(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            entity_db = Path(directory) / "entities.db"
+            EntityStore(entity_db).upsert_entity(
+                "鬼灵门",
+                entity_type="TERM",
+                normalization_policy="normalize",
+            )
+            with (
+                patch.object(web_app, "TransformersRefiner", _IdentityRefiner),
+                patch.object(web_app, "_stream_request", _entity_stream_request),
+            ):
+                app = web_app.create_app(
+                    Path("/tmp/fake-refiner"),
+                    "cpu",
+                    "http://fake-asr",
+                    "Chinese",
+                    32,
+                    None,
+                    entity_db,
+                    "auto",
+                )
+                with TestClient(app) as client:
+                    with client.websocket_connect(
+                        "/ws/stream?mode=streaming&domain=general"
+                    ) as websocket:
+                        self.assertEqual(websocket.receive_json()["event"], "ready")
+                        websocket.send_bytes(b"pcm")
+                        message = websocket.receive_json()
+                        while message["event"] != "update":
+                            message = websocket.receive_json()
+                        self.assertEqual(
+                            message["clean_text"], "鬼灵们是这个副本的入口。"
+                        )
+
+                        websocket.send_json({"event": "finish"})
+                        self.assertEqual(websocket.receive_json()["event"], "transcript")
+                        final = websocket.receive_json()
+
+                        self.assertEqual(final["clean_text"], "鬼灵门是这个副本的入口。")
+                        self.assertEqual(
+                            final["entity_candidates"][0]["decision"],
+                            "AUTO_NORMALIZE",
+                        )
+
+    def test_streaming_final_reuses_completed_window_refinement(self) -> None:
+        with (
+            patch.object(web_app, "TransformersRefiner", _CountingRefiner),
+            patch.object(web_app, "_stream_request", _stable_stream_request),
+        ):
+            app = web_app.create_app(
+                Path("/tmp/fake-refiner"),
+                "cpu",
+                "http://fake-asr",
+                "Chinese",
+                32,
+                None,
+            )
+            with TestClient(app) as client:
+                with client.websocket_connect(
+                    "/ws/stream?mode=streaming"
+                ) as websocket:
+                    self.assertEqual(websocket.receive_json()["event"], "ready")
+                    websocket.send_bytes(b"pcm")
+                    message = websocket.receive_json()
+                    while message["event"] != "update":
+                        message = websocket.receive_json()
+                    calls_before_finish = len(_CountingRefiner.calls)
+                    self.assertGreater(calls_before_finish, 0)
+
+                    websocket.send_json({"event": "finish"})
+                    self.assertEqual(websocket.receive_json()["event"], "transcript")
+                    final = websocket.receive_json()
+
+                    self.assertEqual(final["event"], "final")
+                    self.assertEqual(
+                        final["clean_text"],
+                        "第一段精修文本。第二段精修文本。",
+                    )
+                    self.assertEqual(len(_CountingRefiner.calls), calls_before_finish)
+
     def test_severe_content_loss_retries_with_strict_preservation(self) -> None:
         with (
             patch.object(web_app, "TransformersRefiner", _CompressesOnceRefiner),
@@ -186,10 +336,14 @@ class WebAppFinishTest(unittest.TestCase):
                     final = websocket.receive_json()
                     self.assertEqual(final["clean_text"], _LONG_COMPLETE_TRANSCRIPT)
                     self.assertTrue(final["refiner_accepted"])
-                    self.assertEqual(final["refiner_retry_count"], 1)
+                    self.assertEqual(final["refiner_retry_count"], 2)
                     self.assertEqual(final["placeholder_retry_count"], 0)
                     self.assertIn(
                         "segment_1:severe_content_loss",
+                        final["refiner_retry_reasons"],
+                    )
+                    self.assertIn(
+                        "segment_2:severe_content_loss",
                         final["refiner_retry_reasons"],
                     )
 

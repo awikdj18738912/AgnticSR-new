@@ -63,6 +63,29 @@ class EntityStoreTest(unittest.TestCase):
 
 
 class EntityProtectorTest(unittest.TestCase):
+    def test_bare_markers_restore_without_losing_sentence_boundaries(self) -> None:
+        protector = EntityProtector()
+        protection = protector.protect("版本是2.0。预算是12.5万。")
+        restored = protector.restore("版本是ENTITY_000。预算是ENTITY_001万。", protection)
+        self.assertTrue(restored.accepted)
+        self.assertEqual(restored.text, protection.original_text)
+
+    def test_bare_marker_repairs_do_not_accept_duplicate_or_unknown_ids(self) -> None:
+        protector = EntityProtector()
+        protection = protector.protect("版本是2.0。")
+        for output in ("ENTITY_000和__ENTITY_000__。", "ENTITY_000和ENTITY_999。", "ENTITY_001。"):
+            with self.subTest(output=output):
+                self.assertFalse(protector.restore(output, protection).accepted)
+
+    def test_entity_sentence_collapse_rejected_with_bare_or_exact_markers(self) -> None:
+        protector = EntityProtector()
+        protection = protector.protect("版本是2.0。预算是12.5万。")
+        for output in ("ENTITY_000、ENTITY_001。", "__ENTITY_000__、__ENTITY_001__。"):
+            with self.subTest(output=output):
+                restored = protector.restore(output, protection)
+                self.assertFalse(restored.accepted)
+                self.assertIn("entity_sentence_boundary_lost", restored.reject_reasons)
+
     def test_rules_and_verified_alias_are_restored(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             store = EntityStore(Path(directory) / "entities.db")

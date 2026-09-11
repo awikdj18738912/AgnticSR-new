@@ -6,6 +6,13 @@ from system.refinement_guard import join_refined_segments, reject_reasons, split
 
 
 class RefinementGuardTest(unittest.TestCase):
+    def test_default_refinement_segments_are_at_most_eighty_characters(self) -> None:
+        source = "这是一句需要完整保留的转录文本。" * 12
+        parts = split_for_refinement(source)
+
+        self.assertEqual(join_refined_segments(parts), source)
+        self.assertTrue(all(len(part) <= 80 for part in parts))
+
     def test_sentence_preferred_split_preserves_source(self) -> None:
         source = "第一句需要保留。第二句也需要保留，而且内容稍长。第三句结束。第四句继续说明，确保文本超过分段长度。"
         parts = split_for_refinement(source, max_chars=32)

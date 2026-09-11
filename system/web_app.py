@@ -497,6 +497,67 @@ def create_app(
         streaming_finish_requested = False
         window_refinement = CumulativeWindowRefinement(refine_update)
 
+        def finalize_streaming_windows(
+            raw_text: str,
+            detected_language: str | None,
+            final: bool,
+            protector: EntityProtector,
+            asr_confidence: float | None,
+            matcher_value: EntityCandidateMatcher | None,
+        ) -> dict[str, object]:
+            """Reuse committed streaming refinements and finalize only the tail.
+
+            Intermediate windows deliberately disable automatic fuzzy entity
+            normalization because cumulative ASR hypotheses can still change.
+            Run the inexpensive entity-only fallback over the cached clean text
+            at finalization so reusing Refiner output does not regress final
+            entity replacement.
+            """
+
+            if not window_refinement.has_cached_result:
+                return refine_update(
+                    raw_text,
+                    detected_language,
+                    final,
+                    protector,
+                    asr_confidence,
+                    matcher_value,
+                )
+            result = window_refinement.update(
+                raw_text,
+                detected_language,
+                final,
+                protector,
+                asr_confidence,
+                matcher_value,
+            )
+            entity_result = fallback_update(
+                str(result["clean_text"]),
+                detected_language,
+                protector,
+                asr_confidence,
+                matcher_value,
+                "streaming_final_entity_normalization",
+                time.perf_counter(),
+            )
+            result["clean_text"] = entity_result["clean_text"]
+            result["entity_audit_issues"] = entity_result["entity_audit_issues"]
+            result["entity_refinement_hints"] = entity_result[
+                "entity_refinement_hints"
+            ]
+            result["entity_normalizations"] = [
+                *result.get("entity_normalizations", []),
+                *entity_result["entity_normalizations"],
+            ]
+            result["protected_entities"] = entity_result["protected_entities"]
+            result["entity_candidates"] = entity_result["entity_candidates"]
+            result["entity_matcher_latency_ms"] = round(
+                float(result.get("entity_matcher_latency_ms", 0.0))
+                + float(entity_result["entity_matcher_latency_ms"]),
+                3,
+            )
+            return result
+
         async def process_audio_chunk(audio: bytes) -> tuple[dict[str, object], int]:
             """Forward one chunk while keeping a slow, healthy session visible."""
 
@@ -533,8 +594,8 @@ def create_app(
             nonlocal pending_refinement, streaming_finish_requested
             while pending_refinement is not None:
                 # Refine only a bounded tail of the cumulative ASR hypothesis.
-                # The complete text is refined once more when the client sends
-                # ``finish``; stale intermediate work is discarded then.
+                # Committed results remain cached for finalization; stale UI
+                # updates are discarded once ``finish`` is requested.
                 if streaming_finish_requested:
                     pending_refinement = None
                     return
@@ -592,9 +653,14 @@ def create_app(
             asr_confidence: float | None,
         ) -> dict[str, object]:
             started_at = time.perf_counter()
+            finalizer = (
+                finalize_streaming_windows
+                if requested_mode in {"offline", "streaming"}
+                else refine_update
+            )
             task = asyncio.create_task(
                 asyncio.to_thread(
-                    refine_update,
+                    finalizer,
                     raw_text,
                     detected_language,
                     True,
@@ -649,7 +715,7 @@ def create_app(
                     command = json.loads(text)
                     if command.get("event") != "finish":
                         continue
-                    if requested_mode in {"online", "streaming"}:
+                    if requested_mode in {"online", "offline", "streaming"}:
                         # Mark intermediate output stale immediately. Do not
                         # wait here: a slow partial generation used to delay
                         # the final ASR result and made the refinement panel
@@ -778,10 +844,43 @@ def create_app(
                 if not audio:
                     continue
                 if requested_mode == "offline":
-                    _, chunk_index = await process_audio_chunk(audio)
-                    await send_json(
+                    payload, chunk_index = await process_audio_chunk(audio)
+                    if not await send_json(
                         {"event": "chunk_ack", "chunk_index": chunk_index}
-                    )
+                    ):
+                        break
+                    raw_text = str(payload.get("text", "")).strip()
+                    if raw_text and raw_text != last_raw_text:
+                        last_raw_text = raw_text
+                        detected_language = payload.get("language")
+                        asr_confidence = _optional_confidence(
+                            payload.get("confidence")
+                        )
+                        language_value = (
+                            detected_language
+                            if isinstance(detected_language, str)
+                            else None
+                        )
+                        if not await send_json(
+                            {
+                                "event": "transcript",
+                                "raw_text": raw_text,
+                                "asr_language": language_value,
+                                "asr_confidence": asr_confidence,
+                                "refiner_deferred": False,
+                            }
+                        ):
+                            break
+                        tail_start = max(
+                            0, len(raw_text) - STREAMING_INTERMEDIATE_MAX_CHARS
+                        )
+                        queue_streaming_refinement(
+                            raw_text[tail_start:],
+                            language_value,
+                            asr_confidence,
+                            raw_text,
+                            tail_start,
+                        )
                     continue
                 payload, chunk_index = await process_audio_chunk(audio)
                 if requested_mode == "streaming":
