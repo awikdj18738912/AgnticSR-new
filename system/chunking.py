@@ -9,6 +9,10 @@ _SENTENCE_END = re.compile(r"[.!?\u3002\uff01\uff1f]\s*")
 _ANY_PUNCTUATION = re.compile(
     r"[,;:!?\uff0c\u3002\uff01\uff1f\uff1b\uff1a\u3001]\s*"
 )
+_SELF_CORRECTION = re.compile(r"(?:不对|不是|而是|应该是)")
+_SELF_CORRECTION_PREFIX = re.compile(r"^(?:不对|不是|而是|应该是)")
+_SOFT_CORRECTION_PUNCTUATION = re.compile(r"[,，;；:：、]\s*")
+_SENTENCE_END_CHARACTERS = frozenset(".!?。！？")
 
 
 @dataclass(frozen=True, slots=True)
@@ -23,8 +27,11 @@ class ChunkManager:
     """Convert evolving ASR hypotheses into bounded, stable text chunks.
 
     Hypotheses are cumulative within a VAD segment. Sentence-final punctuation
-    closes a chunk. Text longer than ``max_chars`` is cut at the nearest
-    preceding punctuation, or exactly at the limit when no punctuation exists.
+    closes a chunk. Long clauses containing a self-correction marker
+    (``不对``/``不是``/``而是``) may close at the next clause punctuation even
+    before the hard character limit. Text longer than ``max_chars`` is cut at
+    the nearest preceding punctuation, or exactly at the limit when no
+    punctuation exists.
     A VAD boundary flushes the remaining text and starts a new hypothesis.
     """
 
@@ -80,9 +87,13 @@ class ChunkManager:
                 continue
             emitted.append(Chunk(index=self._next_index, text=text))
             self._next_index += 1
-        return emitted
+        return merge_self_correction_chunks(emitted, self.max_chars)
 
     def _split_point(self, text: str, *, flush: bool) -> int | None:
+        correction_end = self._self_correction_break(text)
+        if correction_end is not None:
+            return correction_end
+
         sentence_end = _SENTENCE_END.search(text)
         if sentence_end is not None and sentence_end.end() <= self.max_chars:
             return sentence_end.end()
@@ -92,3 +103,53 @@ class ChunkManager:
             return candidates[-1].end() if candidates else self.max_chars
 
         return len(text) if flush else None
+
+    def _self_correction_break(self, text: str) -> int | None:
+        """Return a soft boundary for a long self-correction clause."""
+
+        # Keep short examples such as ``苹果，不对，梨`` together so the
+        # Refiner sees the full correction. For longer hypotheses, separate
+        # the corrected clause before another edit is included in the same
+        # generation request.
+        if len(text) <= max(1, self.max_chars // 2):
+            return None
+        for marker in _SELF_CORRECTION.finditer(text):
+            search_start = marker.end()
+            while (
+                search_start < len(text)
+                and text[search_start] in " \t,，;；:：、"
+            ):
+                search_start += 1
+            punctuation = _SOFT_CORRECTION_PUNCTUATION.search(
+                text,
+                search_start,
+                min(len(text), self.max_chars),
+            )
+            if punctuation is not None:
+                return punctuation.end()
+        return None
+
+
+def merge_self_correction_chunks(
+    chunks: list[Chunk], max_chars: int = 80
+) -> list[Chunk]:
+    """Keep a sentence and a following correction in the same chunk.
+
+    ASR punctuation may end the abandoned clause before emitting ``不对``.
+    Merging that prefix prevents the gate from committing the wrong clause
+    before the correction becomes visible.
+    """
+
+    merged: list[Chunk] = []
+    for chunk in chunks:
+        if (
+            merged
+            and _SELF_CORRECTION_PREFIX.match(chunk.text)
+            and merged[-1].text.endswith(tuple(_SENTENCE_END_CHARACTERS))
+            and len(merged[-1].text) + len(chunk.text) <= max_chars
+        ):
+            previous = merged[-1]
+            merged[-1] = Chunk(previous.index, previous.text + chunk.text)
+        else:
+            merged.append(chunk)
+    return merged

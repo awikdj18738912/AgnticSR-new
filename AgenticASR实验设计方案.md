@@ -15,6 +15,7 @@
 - **RQ3：** K=1、K=3、K=5 的质量、延迟和稳定性有什么差异？
 - **RQ4：** 结束时复用窗口缓存，能否减少 Refiner 调用和超时，而不降低最终文本质量？
 - **RQ5：** 内容丢失、占位符、重复生成等安全规则能拦截多少真实错误，又会误拦截多少正常精修？
+- **RQ6：** 可解耦的精修前门控能减少多少 Refiner 调用和延迟，同时是否保持精修质量？
 
 ## 2. 实验原则
 
@@ -60,6 +61,7 @@
 | 最终精修最长等待 | 300 秒 |
 | 严重内容丢失长度比例 | 0.65 |
 | 实体模糊模式 | auto |
+| 精修前门控 | 默认 off；实验组 conservative |
 
 实验开始前应复制这些配置，而不是直接覆盖当前生产配置。
 
@@ -175,6 +177,17 @@ W3 与 W3-Full 的比较直接回答缓存复用是否有效。不要将所有�
 | G2 | G1 + 重复生成检测 |
 | G3 | G2 + 占位符数量、顺序与格式校验 |
 | G4 | G3 + 实体句界校验与严格重试，当前完整方案 |
+
+### 5.4 精修前门控消融
+
+门控模块只负责决定是否调用 Refiner，不参与实体确定性替换，也不替代输出安全校验。使用完全相同的冻结 ASR 输入比较：
+
+| 组别 | `--refinement-gate-mode` | 含义 |
+|---|---|---|
+| R0 | `off` | 原始基线，每个非空片段都调用 Refiner |
+| R1 | `conservative` | 跳过极短片段，以及高置信、句子完整且无清理信号的片段 |
+
+R1 在 ASR 未提供置信度时继续调用 Refiner；有实体提示时也强制进入 Refiner。逐样本记录 `refiner_executed`、`refinement_gate_decisions` 和 `refinement_gate_skipped_segments`，重点比较模型调用/千字、延迟 p50/p95、CER/MER、AASR 和门控误跳过率。
 
 ## 6. 指标定义
 
@@ -332,11 +345,14 @@ conda run --no-capture-output -n agentic-asr \
   --entity-db data/entities.db \
   --entity-domain general \
   --entity-fuzzy-mode auto \
+  --refinement-gate-mode off \
   --batch-size 8 \
   --overwrite
 ```
 
 将 `--entity-fuzzy-mode` 分别设为 `shadow`、`hint` 和 `auto`，生成对应结果。S1 不传 `--entity-db`。
+
+门控 A/B 对比时保持其他参数不变，R0 使用 `--refinement-gate-mode off`，R1 只改为 `--refinement-gate-mode conservative`。不要同时调整实体阈值或窗口大小。
 
 ### 8.3 运行 AASR-Bench Judge
 

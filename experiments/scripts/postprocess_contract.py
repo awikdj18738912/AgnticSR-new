@@ -35,6 +35,11 @@ class InferenceOutcome:
     refiner_retry_count: int = 0
     refiner_retry_reasons: tuple[str, ...] = ()
     refiner_masked_outputs: tuple[str, ...] = ()
+    refiner_executed: bool = True
+    refinement_gate_mode: str = "off"
+    refinement_gate_config: JsonObject | None = None
+    refinement_gate_decisions: tuple[JsonObject, ...] = ()
+    refinement_gate_skipped_segments: int = 0
 
 
 def _output_object(record: JsonObject) -> JsonObject:
@@ -93,6 +98,13 @@ def build_result_record(source: JsonObject, outcome: InferenceOutcome) -> JsonOb
         "refiner_retry_count": outcome.refiner_retry_count,
         "refiner_retry_reasons": list(outcome.refiner_retry_reasons),
         "refiner_masked_outputs": list(outcome.refiner_masked_outputs),
+        "refiner_executed": outcome.refiner_executed,
+        "refinement_gate_mode": outcome.refinement_gate_mode,
+        "refinement_gate_config": outcome.refinement_gate_config or {},
+        "refinement_gate_decisions": list(outcome.refinement_gate_decisions),
+        "refinement_gate_skipped_segments": (
+            outcome.refinement_gate_skipped_segments
+        ),
         "stt_latency_ms": stt_latency,
         "total_latency_ms": total_latency,
     }

@@ -49,6 +49,148 @@ class RefinementGuardTest(unittest.TestCase):
             (),
         )
 
+    def test_long_self_correction_is_not_content_loss(self) -> None:
+        raw = (
+            "请记录这段话，我有一个苹果，不对，我有一个梨。"
+            "这是后面的补充说明，请一并保留。"
+        )
+
+        self.assertNotIn(
+            "severe_content_loss",
+            reject_reasons(
+                raw,
+                "请记录这段话，我有一个梨。这是后面的补充说明，请一并保留。",
+            ),
+        )
+
+    def test_comma_after_self_correction_tail_is_not_content_loss(self) -> None:
+        raw = "你好，我有一个苹果，我有一个梨，不对，我有一个香蕉，我有两千一百三十五元。"
+
+        self.assertNotIn(
+            "severe_content_loss",
+            reject_reasons(raw, "你好，我有一个香蕉，我有2135元。"),
+        )
+
+    def test_numeric_value_change_is_rejected(self) -> None:
+        reasons = reject_reasons(
+            "我有两千一百三十五元。",
+            "我有两百三十五元。",
+        )
+        self.assertIn("numeric_value_mismatch", reasons)
+
+    def test_classifier_quantity_normalization_is_accepted(self) -> None:
+        self.assertEqual(
+            reject_reasons("我有五个苹果。", "我有5个苹果。"),
+            (),
+        )
+
+    def test_ambiguous_digit_run_conversion_is_rejected(self) -> None:
+        self.assertIn(
+            "numeric_value_mismatch",
+            reject_reasons("我有二三个人。", "我有23个人。"),
+        )
+
+    def test_positional_number_normalization_is_accepted(self) -> None:
+        self.assertEqual(
+            reject_reasons("他二十三岁。", "他23岁。"),
+            (),
+        )
+
+    def test_safe_numeric_normalization_is_accepted(self) -> None:
+        self.assertEqual(
+            reject_reasons(
+                "百分之五的概率，日期是二零一五年五月五日。",
+                "5%的概率，日期是2015年5月5日。",
+            ),
+            (),
+        )
+
+    def test_semantic_deletions_are_rejected(self) -> None:
+        cases = (
+            (
+                "看，掘地三尺，要把他给我找出来！",
+                "看，掘地三尺，要把我找出来！",
+            ),
+            (
+                "你认识这位道友，二伯，此人就是我与你说过，那个黄风谷姓韩的。",
+                "你认识这位道友，伯，你我说过，黄风谷姓韩的。",
+            ),
+        )
+        for raw, refined in cases:
+            with self.subTest(raw=raw):
+                self.assertIn("semantic_content_loss", reject_reasons(raw, refined))
+
+    def test_semantic_particle_substitution_is_rejected(self) -> None:
+        self.assertIn(
+            "semantic_substitution",
+            reject_reasons("你当我傻？", "你当我的？"),
+        )
+
+    def test_repetition_cleanup_remains_allowed(self) -> None:
+        self.assertEqual(
+            reject_reasons(
+                "然后哈哈哈，我一五一十的告诉你。",
+                "然后我一五一十的告诉你。",
+            ),
+            (),
+        )
+        self.assertEqual(
+            reject_reasons(
+                "今天有一个苹果，不对，有一个梨。",
+                "今天有一个梨。",
+            ),
+            (),
+        )
+
+    def test_repeated_content_insertion_is_rejected(self) -> None:
+        self.assertIn(
+            "unsupported_insertion",
+            reject_reasons(
+                "随便你们进来打打杀杀，快给我滚！你听见了，我是不会跟你打的。",
+                "随便你们进来杀杀，快给我滚！你听见了，我是不会跟你打杀杀的。",
+            ),
+        )
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+
+class NumericValidationAlignmentTest(unittest.TestCase):
+    """Legal Chinese->Arabic numeric normalizations must pass the guard, while
+    real value changes must still be rejected."""
+
+    def test_legal_normalizations_are_accepted(self) -> None:
+        cases = (
+            ("晚上七点十分开会。", "晚上7点10分开会。"),
+            ("价格涨了一到两点五米。", "价格涨了1到2.5米。"),
+            ("有百分之十二点五的概率。", "有12.5%的概率。"),
+            ("今天是二零一五年十二月五日。", "今天是2015年12月5日。"),
+            ("进度是百分之五。", "进度是5%。"),
+            ("预算两千一百三十五元。", "预算2135元。"),
+            ("他今年三十岁。", "他今年30岁。"),
+            ("走了二十分钟。", "走了20分钟。"),
+            ("我让他五个法器；再不行，我让他十个，怎么样？", "我让他5个法器；再不行，我让他10个，怎么样？"),
+            ("下午三点半开会。", "下午3点半开会。"),
+        )
+        for raw, refined in cases:
+            with self.subTest(raw=raw, refined=refined):
+                reasons = reject_reasons(raw, refined)
+                self.assertNotIn("numeric_value_mismatch", reasons, reasons)
+                self.assertNotIn("severe_content_loss", reasons, reasons)
+
+    def test_real_value_changes_are_rejected(self) -> None:
+        cases = (
+            ("我有两千一百三十五元。", "我有两百三十五元。"),
+            ("我有百分之五的概率。", "我有百分之十五的概率。"),
+            ("今天是一月五日。", "今天是12月5日。"),
+        )
+        for raw, refined in cases:
+            with self.subTest(raw=raw, refined=refined):
+                self.assertIn(
+                    "numeric_value_mismatch", reject_reasons(raw, refined)
+                )
+
 
 if __name__ == "__main__":
     unittest.main()

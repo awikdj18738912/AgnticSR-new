@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Iterable
 
 from .entity_store import EntityDefinition
+from .numeric_normalizer import ContextualNumericNormalizer, _FIXED_EXPRESSIONS
 from .session_memory import SessionEntityMemory
 
 if TYPE_CHECKING:
@@ -15,7 +16,9 @@ if TYPE_CHECKING:
 
 
 _PLACEHOLDER_RE = re.compile(r"__ENTITY_\d{3}__")
-_BARE_PLACEHOLDER_RE = re.compile(r"(?<![A-Za-z0-9_])ENTITY_(\d{3})(?![A-Za-z0-9_])")
+_BARE_PLACEHOLDER_RE = re.compile(
+    r"(?<![A-Za-z0-9])_*ENTITY_(\d{3})_*(?![A-Za-z0-9])"
+)
 _SENTENCE_BOUNDARY_RE = re.compile(r"[。！？!?；;\n]")
 _REFINER_KEY_SUFFIX_RE = re.compile(r"\s*<KEY>\[[^\]]*\]\s*$")
 _RULE_PATTERNS: tuple[tuple[str, re.Pattern[str], int], ...] = (
@@ -60,6 +63,7 @@ _RULE_PATTERNS: tuple[tuple[str, re.Pattern[str], int], ...] = (
         640,
     ),
 )
+_NUMERIC_RULE_TYPES = frozenset({"DATE", "TIME", "NUMBER"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -127,9 +131,13 @@ class EntityProtector:
         entities: Iterable[EntityDefinition] = (),
         *,
         session_memory: SessionEntityMemory | None = None,
+        enable_rule_protection: bool = True,
+        protect_numeric_spans: bool = True,
     ) -> None:
         self.entities = tuple(entities)
         self.session_memory = session_memory
+        self.enable_rule_protection = bool(enable_rule_protection)
+        self.protect_numeric_spans = bool(protect_numeric_spans)
 
     def protect(
         self,
@@ -200,20 +208,69 @@ class EntityProtector:
                             )
                         )
 
-        for entity_type, pattern, priority in _RULE_PATTERNS:
-            for match in pattern.finditer(text):
-                candidates.append(
-                    _Candidate(
-                        start=match.start(),
-                        end=match.end(),
-                        original=match.group(),
-                        replacement=match.group(),
-                        entity_type=entity_type,
-                        source="rule",
-                        priority=priority,
-                        match_type="RULE",
+        if self.enable_rule_protection:
+            for entity_type, pattern, priority in _RULE_PATTERNS:
+                if (
+                    not self.protect_numeric_spans
+                    and entity_type in _NUMERIC_RULE_TYPES
+                ):
+                    continue
+                for match in pattern.finditer(text):
+                    candidates.append(
+                        _Candidate(
+                            start=match.start(),
+                            end=match.end(),
+                            original=match.group(),
+                            replacement=match.group(),
+                            entity_type=entity_type,
+                            source="rule",
+                            priority=priority,
+                            match_type="RULE",
+                        )
                     )
-                )
+            if self.protect_numeric_spans:
+                # Some callers do not run deterministic number normalization
+                # before refinement. They can retain the legacy placeholder
+                # protection explicitly. Numeric-aware streaming callers turn
+                # this off and send already-normalized digits to the Refiner,
+                # then enforce value/order equality with the refinement guard.
+                for change in ContextualNumericNormalizer().normalize(text).changes:
+                    # Skip spans whose previous character is an Arabic digit:
+                    # ``12.5万元`` should stay as one numeric region (the Arabic
+                    # part is already protected), not be split into two adjacent
+                    # placeholders.
+                    if change.start > 0 and text[change.start - 1] in "0123456789":
+                        continue
+                    candidates.append(
+                        _Candidate(
+                            start=change.start,
+                            end=change.end,
+                            original=change.original,
+                            replacement=change.original,
+                            entity_type="CN_NUMBER",
+                            source="rule",
+                            priority=860,
+                            match_type="CN_NUMBER_CONTEXT",
+                        )
+                    )
+            # Fixed idioms (一五一十, 三番五次, 乱七八糟, ...) contain Chinese
+            # numerals but are not numbers.  Mask them as well so the neural
+            # Refiner cannot rewrite their digits (e.g. 三番五次 -> 3番5次);
+            # restoration keeps the original idiom unchanged.
+            for expression in _FIXED_EXPRESSIONS:
+                for match in re.finditer(re.escape(expression), text):
+                    candidates.append(
+                        _Candidate(
+                            start=match.start(),
+                            end=match.end(),
+                            original=match.group(),
+                            replacement=match.group(),
+                            entity_type="IDIOM",
+                            source="rule",
+                            priority=870,
+                            match_type="FIXED_IDIOM",
+                        )
+                    )
 
         rule_ranges = tuple(
             (candidate.start, candidate.end)
@@ -284,8 +341,10 @@ class EntityProtector:
         output = _REFINER_KEY_SUFFIX_RE.sub("", refined_text).strip()
         if not output or "<KEY>" in output:
             return RestorationResult(protection.original_text, False, ("empty_or_metadata_output",))
-        # Only repair the exact bare spelling, never guess IDs or repair
-        # arbitrary malformed markers. Literal source tokens are ambiguous.
+        # Repair placeholders whose underscore framing was damaged by the
+        # Refiner (e.g. __ENTITY_000__ -> ENTITY_000__ / ENTITY_000 / __ENTITY_000_).
+        # Never guess IDs or repair arbitrary malformed markers; literal source
+        # tokens matching the pattern stay ambiguous and are rejected.
         if protection.spans and _BARE_PLACEHOLDER_RE.search(output):
             if _BARE_PLACEHOLDER_RE.search(protection.original_text):
                 return RestorationResult(

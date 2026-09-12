@@ -109,6 +109,28 @@ class EntityProtectorTest(unittest.TestCase):
             self.assertIn("AgenticASR", restored.text)
             self.assertIn("2026年9月8日", restored.text)
 
+    def test_rule_protection_can_be_disabled_without_disabling_database_entities(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = EntityStore(Path(directory) / "entities.db")
+            definition = store.upsert_entity(
+                "厉飞羽",
+                entity_type="PERSON",
+                aliases=("李飞鱼",),
+                normalization_policy="normalize",
+            )
+            protector = EntityProtector(
+                (definition,), enable_rule_protection=False
+            )
+            protection = protector.protect(
+                "李飞鱼的编号是123，网址是https://example.com"
+            )
+
+            self.assertEqual(
+                [span.original for span in protection.spans], ["李飞鱼"]
+            )
+            self.assertIn("123", protection.masked_text)
+            self.assertIn("https://example.com", protection.masked_text)
+
     def test_missing_placeholder_rejects_refiner_output(self) -> None:
         protector = EntityProtector()
         protection = protector.protect("预算是12.5万元。")
@@ -270,6 +292,138 @@ class SessionEntityMemoryTest(unittest.TestCase):
         entry = memory.observe("Whisper", verified=True, now_ms=1000)
         self.assertEqual(entry.trust_level, TrustLevel.VERIFIED)
         self.assertEqual(len(memory.trusted(now_ms=1000)), 1)
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+
+class ChineseNumberProtectionTest(unittest.TestCase):
+    """Chinese numerals in clear numeric contexts are masked so the neural
+    Refiner cannot rewrite them; fixed idioms and ambiguous digit runs stay
+    in their source form."""
+
+    def setUp(self) -> None:
+        self.protector = EntityProtector()
+
+    def test_amount_date_percent_time_are_masked(self) -> None:
+        for source in (
+            "我有两千一百三十五元。",
+            "今天是二零一五年十二月五日。",
+            "百分之五的概率。",
+            "晚上七点十分。",
+            "长一到两点五米。",
+        ):
+            with self.subTest(source=source):
+                protection = self.protector.protect(source)
+                self.assertIn("__ENTITY_", protection.masked_text)
+                self.assertTrue(
+                    all(span.entity_type == "CN_NUMBER" for span in protection.spans),
+                    protection.spans,
+                )
+
+    def test_idioms_and_clear_classifier_quantities_are_masked(self) -> None:
+        # Fixed idioms (一五一十, 三番五次) are masked so the neural Refiner
+        # cannot rewrite their numerals. Clear classifier quantities are masked
+        # as well, so ``五个`` can be rendered as ``5个`` deterministically.
+        for source, expected_masked in (
+            ("此人三番五次欲置我于死地。", "此人__ENTITY_000__欲置我于死地。"),
+            ("他一五一十地说清了经过。", "他__ENTITY_000__地说清了经过。"),
+            ("我有五个苹果。", "我有__ENTITY_000__苹果。"),
+        ):
+            with self.subTest(source=source):
+                protection = self.protector.protect(source)
+                self.assertEqual(protection.masked_text, expected_masked)
+                expected_type = "CN_NUMBER" if "苹果" in source else "IDIOM"
+                self.assertEqual(
+                    [span.entity_type for span in protection.spans], [expected_type]
+                )
+        for source in ("二三个人。", "十几个苹果。"):
+            with self.subTest(source=source):
+                protection = self.protector.protect(source)
+                self.assertEqual(protection.spans, ())
+                self.assertEqual(protection.masked_text, source)
+
+    def test_idiom_masking_restores_original(self) -> None:
+        source = "我一五一十地说，三番五次地催。"
+        protection = self.protector.protect(source)
+        restored = self.protector.restore(protection.masked_text, protection)
+        self.assertTrue(restored.accepted)
+        self.assertEqual(restored.text, source)
+
+    def test_arabic_plus_wan_unit_is_not_split(self) -> None:
+        protection = self.protector.protect("预算是12.5万元。")
+        self.assertEqual(
+            [(span.original, span.entity_type) for span in protection.spans],
+            [("12.5", "NUMBER")],
+        )
+        self.assertEqual(protection.masked_text, "预算是__ENTITY_000__万元。")
+
+    def test_masked_chinese_number_restores_to_original(self) -> None:
+        source = "我有两千一百三十五元，今天是二零一五年十二月五日。"
+        protection = self.protector.protect(source)
+        restored = self.protector.restore(protection.masked_text, protection)
+        self.assertTrue(restored.accepted)
+        self.assertEqual(restored.text, source)
+
+    def test_numeric_aware_path_leaves_numbers_unmasked_but_protects_idioms(self) -> None:
+        protector = EntityProtector(protect_numeric_spans=False)
+        source = "我一五一十地说，让他五个法器，预算是12.5万元。"
+
+        protection = protector.protect(source)
+
+        self.assertEqual(
+            protection.masked_text,
+            "我__ENTITY_000__地说，让他五个法器，预算是12.5万元。",
+        )
+        self.assertEqual(
+            [(span.original, span.entity_type) for span in protection.spans],
+            [("一五一十", "IDIOM")],
+        )
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+
+class DamagedPlaceholderRepairTest(unittest.TestCase):
+    """The Refiner sometimes drops or mangles the underscore framing of a
+    protected placeholder (__ENTITY_000__ -> ENTITY_000__ / ENTITY_000).
+    restore() must repair these variants back to the canonical form."""
+
+    def setUp(self) -> None:
+        self.protector = EntityProtector()
+
+    def _protection_with_spans(self):
+        return self.protector.protect("版本是2.0。预算是12.5万。")
+
+    def test_lost_prefix_underscores_are_repaired(self) -> None:
+        protection = self._protection_with_spans()
+        for output in (
+            "版本是ENTITY_000。预算是ENTITY_001万。",
+            "版本是ENTITY_000__。预算是ENTITY_001__万。",
+            "版本是__ENTITY_000_。预算是__ENTITY_001_万。",
+        ):
+            with self.subTest(output=output):
+                restored = self.protector.restore(output, protection)
+                self.assertTrue(restored.accepted, restored.reject_reasons)
+                self.assertEqual(restored.text, protection.original_text)
+
+    def test_canonical_form_still_works(self) -> None:
+        protection = self._protection_with_spans()
+        restored = self.protector.restore(protection.masked_text, protection)
+        self.assertTrue(restored.accepted)
+        self.assertEqual(restored.text, protection.original_text)
+
+    def test_literal_entity_token_in_source_is_rejected(self) -> None:
+        # If the original ASR text itself contains a bare ENTITY_NNN literal,
+        # repairing it is ambiguous and must be rejected.
+        protection = self.protector.protect("编号是ENTITY_001，版本是2.0。")
+        restored = self.protector.restore(
+            "编号是ENTITY_001，版本是ENTITY_000。", protection
+        )
+        self.assertFalse(restored.accepted)
+        self.assertIn("ambiguous_literal_placeholder", restored.reject_reasons)
 
 
 if __name__ == "__main__":

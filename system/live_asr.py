@@ -161,7 +161,11 @@ def main(argv: list[str] | None = None) -> int:
         if args.identity_refiner
         else MLXRefiner(str(args.refiner), max_tokens=args.max_new_tokens)
     )
-    session = StreamingRefinementSession(refiner, window_size=args.window_size)
+    session = StreamingRefinementSession(
+        refiner,
+        window_size=args.window_size,
+        window_max_chars=args.max_chunk_chars,
+    )
     recognizer = build_recognizer(
         str(args.asr_dir), args.asr_type, args.provider, args.model_type
     )

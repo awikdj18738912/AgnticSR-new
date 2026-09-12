@@ -1,0 +1,32 @@
+cd /home/aim0/桌面/tan/ASR/AgenticASR
+
+CUDA_VISIBLE_DEVICES=0 /home/aim0/anaconda3/bin/conda run --no-capture-output -n qwen3-asr \
+  python -m system.qwen_asr_stream_server \
+  --model /home/aim0/data/models/ASR/Qwen3-ASR-1.7B \
+  --gpu-memory-utilization 0.55 \
+  --max-model-len 32768 \
+  --confidence-logprobs 5 \
+  --vad silero \
+  --vad-model models/silero_vad.onnx \
+  --vad-min-silence 0.7 \
+  --vad-min-speech 0.25 \
+  --vad-preroll 0.35 \
+  --silence-rms-threshold 0.002 \
+  --port 8766
+
+  cd /home/aim0/桌面/tan/ASR/AgenticASR
+
+CUDA_VISIBLE_DEVICES=1 /home/aim0/anaconda3/bin/conda run --no-capture-output -n agentic-asr \
+  python -m system.web_app \
+  --refiner-model /home/aim0/data/models/ASR/AgenticASR-Refiner \
+  --refiner-device cuda:0 \
+  --asr-url http://127.0.0.1:8766 \
+  --language Chinese \
+  --entity-db data/entities.db \
+  --entity-fuzzy-mode auto \
+  --refinement-gate-mode conservative \
+  --output results/web/session.jsonl \
+  --max-new-tokens 256 \
+  --port 8081
+
+# A/B 对比只改这一项：off=原始全量精修，conservative=启用保守门控。

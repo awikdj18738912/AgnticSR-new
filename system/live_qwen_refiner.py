@@ -25,6 +25,7 @@ from typing import Iterable
 import numpy as np
 
 from .backends import EnergyVad, SAMPLE_RATE, VAD_WINDOW, normalize_cjk
+from .deterministic_cleanup import clean_transcript_deterministically
 from .entity_store import EntityStore
 from .entity_matcher import EntityCandidateMatcher, EntityFuzzyMode
 from .entity_pipeline import (
@@ -34,11 +35,16 @@ from .entity_pipeline import (
     prepare_entity_segment,
 )
 from .protection import EntityProtector
+from .refinement_gate import RefinementGate, RefinementGateMode
+from .numeric_normalizer import ContextualNumericNormalizer
 from .session_memory import SessionEntityMemory
 
 SYSTEM_PROMPT = (
     "你是 ASR 文本纠错助手。保留原意，最小修改：去口癖/重复，修错字，补必要标点，"
-    "规范数字、日期、术语和代码符号，处理自我修正。不要总结、扩写或解释。"
+    "处理自我修正。不要总结、扩写或解释。数字、日期、术语和代码符号已由系统规则"
+    "处理，不得自行转换数字，成语中的汉字数字（如三番五次）必须保持原样。"
+    "除明确的口头重复和自我修正废弃片段外，不得删减信息；人称、指代、否定、"
+    "数量、动作对象和地点必须保留。无法确定的修改保留原文。"
     "输入末尾的 <KEY>[词1、词2] 是已验证术语表；仅在原文已出现对应名称或别名时"
     "使用它来纠错或规范为标准名称，不得据此添加原文未提及的实体，也不要在输出中保留 <KEY>。"
     "输入中形如 __ENTITY_000__ 的内容是不可编辑的受保护标记；"
@@ -154,7 +160,7 @@ def _wav_payload(samples: list[np.ndarray]) -> tuple[bytes, float]:
 
 def _transcribe(
     asr_url: str, audio: bytes, language: str | None, timeout: float
-) -> tuple[str, str | None]:
+) -> tuple[str, str | None, float | None]:
     query = urllib.parse.urlencode({"language": language}) if language else ""
     separator = "&" if "?" in asr_url else "?"
     url = f"{asr_url}{separator}{query}" if query else asr_url
@@ -170,7 +176,19 @@ def _transcribe(
     if not isinstance(text, str):
         raise RuntimeError(f"Qwen3-ASR returned no text: {payload}")
     detected_language = payload.get("language")
-    return text, detected_language if isinstance(detected_language, str) else None
+    confidence_value = payload.get("confidence")
+    confidence = (
+        float(confidence_value)
+        if isinstance(confidence_value, (int, float))
+        and not isinstance(confidence_value, bool)
+        and 0 <= float(confidence_value) <= 1
+        else None
+    )
+    return (
+        text,
+        detected_language if isinstance(detected_language, str) else None,
+        confidence,
+    )
 
 
 def _append_record(path: Path, record: dict[str, object]) -> None:
@@ -212,6 +230,22 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default="shadow",
         help="off, shadow, hint, or automatic normalization for complete utterances",
     )
+    parser.add_argument(
+        "--refinement-gate-mode",
+        choices=[mode.value for mode in RefinementGateMode],
+        default="off",
+        help="off preserves the baseline; conservative enables pre-Refiner routing",
+    )
+    parser.add_argument(
+        "--disable-rule-protection",
+        action="store_true",
+        help="disable automatic URL/email/date/time/number/identifier/acronym masking",
+    )
+    parser.add_argument(
+        "--disable-numeric-normalization",
+        action="store_true",
+        help="disable deterministic context-bound Chinese number normalization",
+    )
     args = parser.parse_args(argv)
     if args.preroll < 0 or args.asr_timeout <= 0:
         parser.error("--preroll must be non-negative and --asr-timeout must be positive")
@@ -251,7 +285,14 @@ def main(argv: list[str] | None = None) -> int:
         )
     else:
         entity_definitions = ()
-    protector = EntityProtector(entity_definitions, session_memory=memory)
+    protector = EntityProtector(
+        entity_definitions,
+        session_memory=memory,
+        enable_rule_protection=not args.disable_rule_protection,
+        # Numeric normalization and value validation make placeholder masking
+        # unnecessary here; leave placeholders for terms and fixed idioms.
+        protect_numeric_spans=False,
+    )
     fuzzy_mode = EntityFuzzyMode.parse(args.entity_fuzzy_mode)
     matcher = (
         EntityCandidateMatcher(
@@ -262,6 +303,8 @@ def main(argv: list[str] | None = None) -> int:
         if entity_definitions and fuzzy_mode is not EntityFuzzyMode.OFF
         else None
     )
+    refinement_gate = RefinementGate(args.refinement_gate_mode)
+    numeric_normalizer = ContextualNumericNormalizer()
     print(f"Using Qwen3-ASR service at {args.asr_url}")
     print("Listening. Press Ctrl+C to stop.", flush=True)
 
@@ -274,7 +317,7 @@ def main(argv: list[str] | None = None) -> int:
 
     def transcribe_and_refine(samples: list[np.ndarray]) -> None:
         payload, duration = _wav_payload(samples)
-        raw_text, detected_language = _transcribe(
+        raw_text, detected_language, asr_confidence = _transcribe(
             args.asr_url, payload, language, args.asr_timeout
         )
         raw_text = normalize_cjk(raw_text).strip()
@@ -285,32 +328,81 @@ def main(argv: list[str] | None = None) -> int:
             protector,
             matcher,
             allow_auto=True,
+            confidence=asr_confidence,
         )
         protection = prepared.protection
-        refined_text, latency_ms = refiner.refine(
-            protection.masked_text, entity_hints=prepared.hints
+        normalized_baseline = (
+            numeric_normalizer.normalize(prepared.baseline_text)
+            if not args.disable_numeric_normalization
+            else None
         )
-        refiner_masked_outputs = [refined_text]
-        finalized = finalize_entity_segment(
-            refined_text, prepared, protector
+        baseline_text = (
+            normalized_baseline.text
+            if normalized_baseline is not None
+            else prepared.baseline_text
         )
+        masked_text = (
+            numeric_normalizer.normalize(protection.masked_text).text
+            if not args.disable_numeric_normalization
+            else protection.masked_text
+        )
+        gate_decision = refinement_gate.decide(
+            baseline_text,
+            asr_confidence=asr_confidence,
+            entity_hints=prepared.hints,
+        )
+        refiner_executed = gate_decision.should_refine
+        latency_ms = 0.0
+        refiner_masked_outputs: list[str] = []
         placeholder_retry_count = 0
         refiner_retry_count = 0
         refiner_retry_reasons: tuple[str, ...] = ()
-        if has_retryable_integrity_failure(finalized.reject_reasons):
-            refiner_retry_reasons = finalized.reject_reasons
-            placeholder_failed = has_placeholder_failure(finalized.reject_reasons)
-            refined_text, retry_latency_ms = refiner.refine(
-                protection.masked_text,
-                entity_hints=prepared.hints,
-                strict_placeholders=True,
+        if gate_decision.should_refine:
+            refined_text, latency_ms = refiner.refine(
+                masked_text, entity_hints=prepared.hints
             )
-            latency_ms += retry_latency_ms
-            refiner_retry_count = 1
-            placeholder_retry_count = int(placeholder_failed)
             refiner_masked_outputs.append(refined_text)
             finalized = finalize_entity_segment(refined_text, prepared, protector)
-        refined_text = finalized.text
+            if has_retryable_integrity_failure(finalized.reject_reasons):
+                refiner_retry_reasons = finalized.reject_reasons
+                placeholder_failed = has_placeholder_failure(
+                    finalized.reject_reasons
+                )
+                refined_text, retry_latency_ms = refiner.refine(
+                    masked_text,
+                    entity_hints=prepared.hints,
+                    strict_placeholders=True,
+                )
+                latency_ms += retry_latency_ms
+                refiner_retry_count = 1
+                placeholder_retry_count = int(placeholder_failed)
+                refiner_masked_outputs.append(refined_text)
+                finalized = finalize_entity_segment(
+                    refined_text, prepared, protector
+                )
+            refined_text = finalized.text
+        else:
+            refined_text = baseline_text
+            finalized_accepted = True
+            finalized_reasons: tuple[str, ...] = ()
+        numeric_changes = ()
+        if not args.disable_numeric_normalization:
+            normalized_output = numeric_normalizer.normalize(refined_text)
+            refined_text = normalized_output.text
+            numeric_changes = (
+                normalized_output.changes
+                if normalized_output.changes
+                else normalized_baseline.changes
+            )
+        refined_text = clean_transcript_deterministically(refined_text)
+        if not gate_decision.should_refine:
+            print(
+                "[refinement gate] skipped: " + ", ".join(gate_decision.reasons),
+                flush=True,
+            )
+        else:
+            finalized_accepted = finalized.accepted
+            finalized_reasons = finalized.reject_reasons
         entity_normalizations = prepared.normalizations
         entity_audit_issues = protector.audit_unmasked(refined_text, protection)
         print(f"[raw] {raw_text}")
@@ -335,18 +427,29 @@ def main(argv: list[str] | None = None) -> int:
                     "captured_at": datetime.now(timezone.utc).isoformat(),
                     "audio_seconds": round(duration, 3),
                     "asr_language": detected_language,
+                    "asr_confidence": asr_confidence,
                     "output": {
                         "raw_text": raw_text,
                         "clean_text": refined_text,
                         "llm_latency_ms": latency_ms,
-                        "refiner_accepted": finalized.accepted,
-                        "refiner_reject_reasons": list(finalized.reject_reasons),
+                        "refiner_executed": refiner_executed,
+                        "refiner_accepted": finalized_accepted,
+                        "refiner_reject_reasons": list(finalized_reasons),
                         "placeholder_retry_count": placeholder_retry_count,
                         "refiner_retry_count": refiner_retry_count,
                         "refiner_retry_reasons": list(refiner_retry_reasons),
                         "refiner_masked_outputs": refiner_masked_outputs,
+                        "refinement_gate_mode": refinement_gate.mode.value,
+                        "refinement_gate_config": refinement_gate.config_dict(),
+                        "refinement_gate_decisions": [gate_decision.public_dict()],
+                        "refinement_gate_skipped_segments": int(
+                            not gate_decision.should_refine
+                        ),
                         "entity_audit_issues": list(entity_audit_issues),
                         "entity_normalizations": list(entity_normalizations),
+                        "numeric_normalizations": [
+                            change.public_dict() for change in numeric_changes
+                        ],
                         "protected_entities": [
                             span.public_dict() for span in protection.spans
                         ],
@@ -360,6 +463,8 @@ def main(argv: list[str] | None = None) -> int:
                         "entity_matching_config_version": (
                             matcher.config.version if matcher is not None else None
                         ),
+                        "rule_protection_enabled": not args.disable_rule_protection,
+                        "numeric_normalization_enabled": not args.disable_numeric_normalization,
                     },
                 },
             )

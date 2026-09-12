@@ -28,6 +28,13 @@
     button.small-button { min-width: auto; height: 30px; padding: 0 8px; border-color: #aebbb8; background: #fff; color: #17201f; font-size: 12px; font-weight: 600; }
     button.danger { border-color: #a62927; color: #a62927; }
     .timer { color: #53615f; font-variant-numeric: tabular-nums; }
+    .session-metrics { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; margin: 18px 0 0; padding: 0; }
+    .session-metrics > div { padding: 14px 16px; border: 1px solid #bfd0cc; border-radius: 8px; background: #edf5f2; }
+    .session-metrics dt { color: #53615f; font-size: 12px; }
+    .session-metrics dd { display: flex; align-items: baseline; gap: 5px; margin: 5px 0 2px; color: #006b60; font-variant-numeric: tabular-nums; }
+    .session-metrics .metric-value { font-size: 28px; font-weight: 720; line-height: 1.1; }
+    .session-metrics .metric-unit { font-size: 13px; font-weight: 650; }
+    .session-metrics small { color: #66736f; font-size: 12px; }
     .refiner-status { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; padding: 18px 0; border-bottom: 1px solid #c9d1cf; }
     .refiner-status div { min-height: 74px; padding: 12px; border: 1px solid #d5dcda; border-radius: 6px; background: #fff; }
     .refiner-status dt { margin: 0 0 7px; color: #53615f; font-size: 12px; }
@@ -92,7 +99,7 @@
     .form-field input, .form-field select, .form-field textarea { width: 100%; color: #17201f; }
     .checkbox-field { display: flex; align-items: center; gap: 8px; color: #17201f; }
     .field-help { margin: 0; color: #53615f; font-size: 12px; line-height: 1.45; }
-    @media (max-width: 620px) { main { padding-top: 32px; } .header-row, .control, .panel-header { align-items: flex-start; flex-direction: column; } .refiner-status, .results, .form-grid { grid-template-columns: 1fr; gap: 12px; } .results { gap: 22px; } .form-field.full { grid-column: auto; } button:not(.secondary):not(.small-button) { width: 100%; } }
+    @media (max-width: 620px) { main { padding-top: 32px; } .header-row, .control, .panel-header { align-items: flex-start; flex-direction: column; } .session-metrics, .refiner-status, .results, .form-grid { grid-template-columns: 1fr; gap: 12px; } .results { gap: 22px; } .form-field.full { grid-column: auto; } button:not(.secondary):not(.small-button) { width: 100%; } }
   </style>
 </head>
 <body>
@@ -121,6 +128,18 @@
       </label>
       <span id="timer" class="timer">00:00</span>
     </div>
+    <dl class="session-metrics" aria-label="本次转写调用统计">
+      <div>
+        <dt>精修模型调用次数</dt>
+        <dd><span id="refiner-call-count" class="metric-value">0</span><span class="metric-unit">次</span></dd>
+        <small>包含首次调用和安全重试</small>
+      </div>
+      <div>
+        <dt>门控跳过次数</dt>
+        <dd><span id="gate-skip-count" class="metric-value">0</span><span class="metric-unit">次</span></dd>
+        <small>按跳过的精修句块累计</small>
+      </div>
+    </dl>
     <dl class="refiner-status" aria-label="精修执行状态">
       <div><dt>Refiner 是否执行</dt><dd id="refiner-executed">未执行</dd></div>
       <div><dt>执行结果</dt><dd id="refiner-result">等待识别文本</dd></div>
@@ -194,6 +213,8 @@
     const refinerExecuted = document.querySelector('#refiner-executed');
     const refinerResult = document.querySelector('#refiner-result');
     const refinerType = document.querySelector('#refiner-type');
+    const refinerCallCount = document.querySelector('#refiner-call-count');
+    const gateSkipCount = document.querySelector('#gate-skip-count');
     const historyCount = document.querySelector('#history-count');
     const historyEmpty = document.querySelector('#history-empty');
     const refinementList = document.querySelector('#refinement-list');
@@ -231,7 +252,7 @@
     // The final Refiner pass scales with the number of text segments.  The
     // backend sends periodic progress events and has its own hard deadline.
     const FINISH_WATCHDOG_MS = 360000;
-    let context, source, processor, stream, socket, buffered = new Float32Array(0), running = false, finishing = false, startedAt, ticker, finishWatchdog, selectedMode = 'online', entities = [], refinementHistory = [], seenRefinementChanges = new Set(), latestRefinedText = '';
+    let context, source, processor, stream, socket, buffered = new Float32Array(0), running = false, finishing = false, startedAt, ticker, finishWatchdog, selectedMode = 'online', entities = [], refinementHistory = [], seenRefinementChanges = new Set(), latestRefinedText = '', lastAppliedRefinementRevision = 0;
 
     function escapeHtml(value) {
       return String(value).replace(/[&<>'"]/g, character => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#39;', '"': '&quot;' })[character]);
@@ -333,6 +354,18 @@
       refinerResult.textContent = '等待识别文本';
       refinerResult.classList.remove('warning');
       refinerType.textContent = '—';
+      refinerCallCount.textContent = '0';
+      gateSkipCount.textContent = '0';
+    }
+
+    function updateSessionMetrics(data) {
+      const stats = data && typeof data.refiner_session_stats === 'object'
+        ? data.refiner_session_stats
+        : null;
+      const calls = stats ? Number(stats.call_count) : Number(data.session_refiner_call_count);
+      const skips = stats ? Number(stats.gate_skipped_segment_count) : Number(data.session_gate_skipped_segment_count);
+      if (Number.isFinite(calls) && calls >= 0) refinerCallCount.textContent = String(Math.trunc(calls));
+      if (Number.isFinite(skips) && skips >= 0) gateSkipCount.textContent = String(Math.trunc(skips));
     }
 
     function refinementStageLabel(data) {
@@ -494,6 +527,18 @@
       const auditIssues = Array.isArray(data.entity_audit_issues) ? data.entity_audit_issues : [];
       const entityHints = Array.isArray(data.entity_refinement_hints) ? data.entity_refinement_hints : [];
       const entityChanges = Array.isArray(data.entity_normalizations) ? data.entity_normalizations : [];
+      if (data.refiner_executed === false) {
+        const decisions = Array.isArray(data.refinement_gate_decisions) ? data.refinement_gate_decisions : [];
+        const skipped = decisions.filter(item => item.action === 'skip');
+        const reasons = [...new Set(skipped.flatMap(item => Array.isArray(item.reasons) ? item.reasons : []))];
+        refinerExecuted.textContent = `门控跳过 · ${skipped.length || data.refinement_gate_skipped_segments || 0} 段`;
+        refinerResult.textContent = reasons.length
+          ? `未调用模型，已保留确定性结果：${reasons.join('、')}`
+          : '未调用模型，已保留确定性结果';
+        refinerResult.classList.remove('warning');
+        refinerType.textContent = `${modeType} · ${data.refinement_gate_mode || 'conservative'} 门控`;
+        return;
+      }
       refinerExecuted.textContent = `已执行 · ${data.refiner_latency_ms} ms`;
       refinerType.textContent = modeType;
       if (data.refiner_accepted === false) {
@@ -599,6 +644,7 @@
           // update the shared transcript panes and refinement history.
           if (socket !== currentSocket) return;
           const data = JSON.parse(event.data);
+          updateSessionMetrics(data);
           if (data.event === 'chunk_ack') {
             currentSocket.dispatchEvent(new Event('chunk-ack'));
             return;
@@ -619,6 +665,13 @@
           if (data.event === 'status' && data.stage === 'asr_chunk') {
             setStatus(`正在处理音频块 ${data.chunk_index || ''}· 已等待 ${data.elapsed_seconds || 0} 秒`);
             return;
+          }
+          if (data.event === 'update' || data.event === 'final') {
+            const revision = Number(data.refinement_revision);
+            if (Number.isFinite(revision)) {
+              if (revision < lastAppliedRefinementRevision) return;
+              lastAppliedRefinementRevision = revision;
+            }
           }
           if (data.raw_text !== undefined && data.event !== 'update') raw.textContent = data.raw_text;
           if (data.clean_text !== undefined) {
@@ -720,7 +773,7 @@
         setButton(false, true); setStatus(`正在读取文件：${file.name}`);
         const samples = await decodeAudioFile(file);
         await connectSocket();
-        raw.textContent = ''; clean.textContent = ''; latestRefinedText = ''; resetRefinerStatus(); resetRefinementHistory();
+        raw.textContent = ''; clean.textContent = ''; latestRefinedText = ''; lastAppliedRefinementRevision = 0; resetRefinerStatus(); resetRefinementHistory();
         running = true; startedAt = Date.now(); ticker = setInterval(updateTimer, 250); updateTimer();
         setButton(false, true);
         if (selectedMode === 'offline') {
@@ -769,7 +822,7 @@
           flushChunks();
         };
         source.connect(processor); processor.connect(context.destination);
-        buffered = new Float32Array(0); raw.textContent = ''; clean.textContent = ''; latestRefinedText = ''; resetRefinerStatus(); resetRefinementHistory();
+        buffered = new Float32Array(0); raw.textContent = ''; clean.textContent = ''; latestRefinedText = ''; lastAppliedRefinementRevision = 0; resetRefinerStatus(); resetRefinementHistory();
         running = true; startedAt = Date.now(); ticker = setInterval(updateTimer, 250); updateTimer();
         setButton(true); setStatus('实时识别中');
       } catch (error) {

@@ -19,6 +19,13 @@ python -m pip install -r system/requirements.txt
 python -m pip install mlx mlx-lm
 ```
 
+The browser Qwen backend also needs `sherpa-onnx` in the environment that
+starts `qwen_asr_stream_server`; it provides the Silero VAD runtime:
+
+```bash
+python -m pip install sherpa-onnx
+```
+
 Place an online sherpa-onnx checkpoint under `models/asr/` with `tokens.txt` and either transducer files (`encoder*.onnx`, `decoder*.onnx`, `joiner*.onnx`) or a Wenet CTC model (`model*.onnx`).
 
 Download the default Silero VAD:
@@ -68,8 +75,32 @@ CUDA_VISIBLE_DEVICES=0 conda run --no-capture-output -n qwen3-asr \
   --model /path/to/Qwen3-ASR-0.6B \
   --gpu-memory-utilization 0.55 \
   --max-model-len 32768 \
+  --confidence-logprobs 5 \
+  --vad silero \
+  --vad-model models/silero_vad.onnx \
+  --vad-min-silence 0.7 \
+  --vad-min-speech 0.25 \
+  --vad-preroll 0.35 \
+  --silence-rms-threshold 0.002 \
   --port 8766
 ```
+
+`--confidence-logprobs 5` enables an experimental vLLM token-logprob path.
+The service then returns `confidence`, `confidence_mean_logprob`, and related
+metadata on streaming responses. The score is a geometric mean token
+probability and is **not calibrated** until a development-set temperature is
+learned. Use `--confidence-temperature T --confidence-calibrated` only after
+that calibration. Until then, treat the score as a shadow/experimental signal;
+the current conservative gate may consume it, so do not interpret skipped
+segments as a production-quality decision.
+
+The default browser path uses a per-session Silero VAD before Qwen decoding.
+Non-speech chunks are returned as `silence_skipped=true` and are not sent to
+ASR or Refiner. A short pre-roll (`--vad-preroll`) is replayed when speech
+starts, and the endpoint chunk is retained so that the first and last syllables
+are not dropped. The RMS check remains a cheap fallback when `--vad off` is
+selected; set `--silence-rms-threshold 0` to disable that fallback. For a
+dependency-free diagnostic, use `--vad energy` instead of `--vad silero`.
 
 The service bounds each Qwen streaming state to protect long recordings from
 the upstream implementation's growing full-audio reprocessing cost. It starts
@@ -152,9 +183,42 @@ CUDA_VISIBLE_DEVICES=1 conda run --no-capture-output -n agentic-asr \
   --asr-url http://127.0.0.1:8766 \
   --entity-db data/entities.db \
   --entity-fuzzy-mode shadow \
+  --refinement-gate-mode conservative \
   --output results/web/session.jsonl \
   --port 8081
 ```
+
+The routing gate is a separate deterministic module and does not change entity
+normalization or the post-generation safety validator. Use
+`--refinement-gate-mode off` for the original always-refine baseline, and use
+`--refinement-gate-mode conservative` for the gated experiment. Conservative
+mode skips very short fragments and complete high-confidence segments without
+cleanup signals. Missing ASR confidence fails open to the Refiner. Each Web
+response and JSONL record includes `refiner_executed`,
+`refinement_gate_config`, `refinement_gate_decisions`, and
+`refinement_gate_skipped_segments`.
+
+Context-bound Chinese number normalization is enabled by default after entity
+preparation and again after Refiner validation. It deterministically handles
+money, percentages, complete dates/times, measurements, clear classifier
+quantities, and positional numbers such as `二十三` or `一百二十三万`.
+Adjacent digit runs (`二三`, `二三十`) and fixed expressions such as `一五一十`
+remain in Chinese. Each result records `numeric_normalizations`; use
+`--disable-numeric-normalization` only when running an A/B baseline without
+this module. Numeric-aware streaming paths send the deterministically
+normalized digits directly to the Refiner instead of replacing numbers with
+`__ENTITY_NNN__` placeholders. The output guard compares numeric values,
+order, and unit context and falls back to the normalized source if the model
+changes them. Verified terms, acronyms, URLs, and fixed idioms remain eligible
+for placeholder protection.
+
+After sentence windows are joined, a deterministic repetition pass collapses
+two or more adjacent identical short utterances (up to eight visible
+characters), including exclamation-mark-separated runs such as
+`可恶！可恶！`, to one occurrence.
+Adjacent repeated pronouns and demonstratives used as stutters, such as
+`你你竟结成了元婴` or `我我不知道`, are also collapsed deterministically.
+Normal lexical or verb reduplication (`人人`, `天天`, `好好`, `看看`) is preserved.
 
 When the server is started with `--entity-db`, the browser page also exposes a
 local **术语库管理** panel. It can search, add, edit, enable/disable, and

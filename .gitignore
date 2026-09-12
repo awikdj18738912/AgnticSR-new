@@ -10,6 +10,9 @@ pipeline/runtime/
 experiments/asr_results/
 experiments/judge_results/
 experiments/summary/
+results/runtime/
+results/web/*.jsonl
+*.orig
 
 # Local model weights and audio assets
 models/

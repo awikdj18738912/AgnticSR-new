@@ -107,6 +107,36 @@ class _CompressesOnceRefiner:
         return (text, 2.0) if strict_placeholders else ("你怎么拼？", 1.0)
 
 
+class _SemanticLossOnceRefiner:
+    def __init__(self, *args, **kwargs) -> None:
+        pass
+
+    def refine(
+        self,
+        text: str,
+        *,
+        entity_hints: tuple[str, ...] = (),
+        strict_placeholders: bool = False,
+    ) -> tuple[str, float]:
+        if strict_placeholders:
+            return text, 2.0
+        return text.replace("傻", "的"), 1.0
+
+
+class _WrongNumberRefiner:
+    def __init__(self, *args, **kwargs) -> None:
+        pass
+
+    def refine(
+        self,
+        text: str,
+        *,
+        entity_hints: tuple[str, ...] = (),
+        strict_placeholders: bool = False,
+    ) -> tuple[str, float]:
+        return "你好，我有22000元。", 1.0
+
+
 def _fake_stream_request(
     asr_url: str,
     endpoint: str,
@@ -193,8 +223,271 @@ def _content_loss_stream_request(
     raise AssertionError(f"unexpected endpoint: {endpoint}")
 
 
+def _short_high_confidence_stream_request(
+    asr_url: str,
+    endpoint: str,
+    session_id: str | None = None,
+    data: bytes = b"",
+    params: dict[str, str] | None = None,
+) -> dict[str, object]:
+    if endpoint == "/stream/start":
+        return {"session_id": "gate-test-session"}
+    if endpoint == "/stream/finish":
+        return {"text": "好。", "language": "Chinese", "confidence": 0.99}
+    if endpoint == "/stream/cancel":
+        return {"cancelled": True}
+    raise AssertionError(f"unexpected endpoint: {endpoint}")
+
+
+def _trusted_high_confidence_stream_request(
+    asr_url: str,
+    endpoint: str,
+    session_id: str | None = None,
+    data: bytes = b"",
+    params: dict[str, str] | None = None,
+) -> dict[str, object]:
+    if endpoint == "/stream/start":
+        return {"session_id": "trusted-confidence-test-session"}
+    if endpoint == "/stream/finish":
+        return {
+            "text": "今天天气很好。",
+            "language": "Chinese",
+            "confidence": 0.99,
+            "confidence_calibrated": True,
+            "confidence_covers_full_text": True,
+            "confidence_scope": "full_text",
+            "confidence_source": "qwen_vllm_token_logprobs",
+            "confidence_token_count": 8,
+        }
+    if endpoint == "/stream/cancel":
+        return {"cancelled": True}
+    raise AssertionError(f"unexpected endpoint: {endpoint}")
+
+
+def _untrusted_high_confidence_stream_request(
+    asr_url: str,
+    endpoint: str,
+    session_id: str | None = None,
+    data: bytes = b"",
+    params: dict[str, str] | None = None,
+) -> dict[str, object]:
+    payload = _trusted_high_confidence_stream_request(
+        asr_url, endpoint, session_id, data, params
+    )
+    if endpoint == "/stream/finish":
+        payload.pop("confidence_calibrated", None)
+        payload.pop("confidence_covers_full_text", None)
+        payload["confidence_scope"] = "latest_decode_tokens"
+    return payload
+
+
+def _numeric_stream_request(
+    asr_url: str,
+    endpoint: str,
+    session_id: str | None = None,
+    data: bytes = b"",
+    params: dict[str, str] | None = None,
+) -> dict[str, object]:
+    if endpoint == "/stream/start":
+        return {"session_id": "numeric-test-session"}
+    if endpoint == "/stream/finish":
+        return {"text": "你好，我有二万二千二百元。", "language": "Chinese"}
+    if endpoint == "/stream/cancel":
+        return {"cancelled": True}
+    raise AssertionError(f"unexpected endpoint: {endpoint}")
+
+
 @unittest.skipIf(web_app is None, "FastAPI is not installed")
 class WebAppFinishTest(unittest.TestCase):
+    def test_numeric_text_reaches_refiner_normalized_without_placeholders(self) -> None:
+        with (
+            patch.object(web_app, "TransformersRefiner", _CountingRefiner),
+            patch.object(web_app, "_stream_request", _numeric_stream_request),
+        ):
+            app = web_app.create_app(
+                Path("/tmp/fake-refiner"),
+                "cpu",
+                "http://fake-asr",
+                "Chinese",
+                32,
+                None,
+            )
+            with TestClient(app) as client:
+                with client.websocket_connect("/ws/stream?mode=online") as websocket:
+                    self.assertEqual(websocket.receive_json()["event"], "ready")
+                    websocket.send_json({"event": "finish"})
+                    self.assertEqual(websocket.receive_json()["event"], "transcript")
+                    final = websocket.receive_json()
+
+        self.assertIn("你好，我有22200元。", _CountingRefiner.calls)
+        self.assertTrue(
+            all("__ENTITY_" not in value for value in _CountingRefiner.calls)
+        )
+        self.assertEqual(final["clean_text"], "你好，我有22200元。")
+        self.assertEqual(final["protected_entities"], [])
+
+    def test_wrong_model_number_falls_back_to_exact_deterministic_value(self) -> None:
+        with (
+            patch.object(web_app, "TransformersRefiner", _WrongNumberRefiner),
+            patch.object(web_app, "_stream_request", _numeric_stream_request),
+        ):
+            app = web_app.create_app(
+                Path("/tmp/fake-refiner"),
+                "cpu",
+                "http://fake-asr",
+                "Chinese",
+                32,
+                None,
+            )
+            with TestClient(app) as client:
+                with client.websocket_connect("/ws/stream?mode=online") as websocket:
+                    self.assertEqual(websocket.receive_json()["event"], "ready")
+                    websocket.send_json({"event": "finish"})
+                    self.assertEqual(websocket.receive_json()["event"], "transcript")
+                    final = websocket.receive_json()
+
+        self.assertEqual(final["clean_text"], "你好，我有22200元。")
+        self.assertTrue(final["numeric_normalization_enabled"])
+        self.assertEqual(
+            final["numeric_normalizations"][0]["replacement"], "22200元"
+        )
+
+    def test_conservative_gate_skips_short_segment_without_calling_model(self) -> None:
+        with (
+            patch.object(web_app, "TransformersRefiner", _CountingRefiner),
+            patch.object(
+                web_app, "_stream_request", _short_high_confidence_stream_request
+            ),
+        ):
+            app = web_app.create_app(
+                Path("/tmp/fake-refiner"),
+                "cpu",
+                "http://fake-asr",
+                "Chinese",
+                32,
+                None,
+                None,
+                "shadow",
+                "conservative",
+            )
+            with TestClient(app) as client:
+                with client.websocket_connect("/ws/stream?mode=online") as websocket:
+                    self.assertEqual(websocket.receive_json()["event"], "ready")
+                    websocket.send_json({"event": "finish"})
+                    self.assertEqual(websocket.receive_json()["event"], "transcript")
+                    final = websocket.receive_json()
+
+            self.assertEqual(final["clean_text"], "好。")
+            self.assertFalse(final["refiner_executed"])
+            self.assertEqual(final["refinement_gate_skipped_segments"], 1)
+            self.assertEqual(final["refinement_gate_decisions"][0]["action"], "skip")
+            self.assertEqual(_CountingRefiner.calls, [])
+            self.assertEqual(final["session_refiner_call_count"], 0)
+            self.assertEqual(
+                final["refiner_session_stats"]["gate_skipped_segment_count"], 1
+            )
+            self.assertTrue(final["refiner_session_stats"]["stats_complete"])
+
+    def test_conservative_gate_uses_only_calibrated_full_text_confidence(self) -> None:
+        with (
+            patch.object(web_app, "TransformersRefiner", _CountingRefiner),
+            patch.object(
+                web_app, "_stream_request", _trusted_high_confidence_stream_request
+            ),
+        ):
+            app = web_app.create_app(
+                Path("/tmp/fake-refiner"),
+                "cpu",
+                "http://fake-asr",
+                "Chinese",
+                32,
+                None,
+                None,
+                "shadow",
+                "conservative",
+            )
+            with TestClient(app) as client:
+                with client.websocket_connect("/ws/stream?mode=online") as websocket:
+                    self.assertEqual(websocket.receive_json()["event"], "ready")
+                    websocket.send_json({"event": "finish"})
+                    transcript = websocket.receive_json()
+                    final = websocket.receive_json()
+
+        self.assertEqual(transcript["asr_confidence_metadata"]["scope"], "full_text")
+        self.assertFalse(final["refiner_executed"])
+        self.assertEqual(final["session_refiner_call_count"], 0)
+        self.assertEqual(
+            final["refinement_gate_decisions"][0]["reasons"],
+            ["high_confidence_clean_segment"],
+        )
+
+    def test_untrusted_high_confidence_fails_open_to_refiner(self) -> None:
+        with (
+            patch.object(web_app, "TransformersRefiner", _CountingRefiner),
+            patch.object(
+                web_app,
+                "_stream_request",
+                _untrusted_high_confidence_stream_request,
+            ),
+        ):
+            app = web_app.create_app(
+                Path("/tmp/fake-refiner"),
+                "cpu",
+                "http://fake-asr",
+                "Chinese",
+                32,
+                None,
+                None,
+                "shadow",
+                "conservative",
+            )
+            with TestClient(app) as client:
+                with client.websocket_connect("/ws/stream?mode=online") as websocket:
+                    self.assertEqual(websocket.receive_json()["event"], "ready")
+                    websocket.send_json({"event": "finish"})
+                    websocket.receive_json()
+                    final = websocket.receive_json()
+
+        self.assertTrue(final["refiner_executed"])
+        self.assertEqual(final["session_refiner_call_count"], 1)
+        self.assertEqual(
+            final["refinement_gate_decisions"][0]["reasons"],
+            ["confidence_uncalibrated"],
+        )
+
+    def test_off_gate_preserves_original_refiner_path(self) -> None:
+        with (
+            patch.object(web_app, "TransformersRefiner", _CountingRefiner),
+            patch.object(
+                web_app, "_stream_request", _short_high_confidence_stream_request
+            ),
+        ):
+            app = web_app.create_app(
+                Path("/tmp/fake-refiner"),
+                "cpu",
+                "http://fake-asr",
+                "Chinese",
+                32,
+                None,
+                None,
+                "shadow",
+                "off",
+            )
+            with TestClient(app) as client:
+                with client.websocket_connect("/ws/stream?mode=online") as websocket:
+                    self.assertEqual(websocket.receive_json()["event"], "ready")
+                    websocket.send_json({"event": "finish"})
+                    self.assertEqual(websocket.receive_json()["event"], "transcript")
+                    final = websocket.receive_json()
+
+            self.assertTrue(final["refiner_executed"])
+            self.assertEqual(final["refinement_gate_skipped_segments"], 0)
+            self.assertEqual(final["refinement_gate_decisions"][0]["action"], "refine")
+            self.assertEqual(len(_CountingRefiner.calls), 1)
+            self.assertEqual(final["session_refiner_call_count"], 1)
+            self.assertEqual(final["session_refiner_initial_call_count"], 1)
+            self.assertEqual(final["session_refiner_retry_call_count"], 0)
+
     def test_offline_mode_reuses_completed_window_refinement(self) -> None:
         with (
             patch.object(web_app, "TransformersRefiner", _CountingRefiner),
@@ -230,6 +523,41 @@ class WebAppFinishTest(unittest.TestCase):
                         "第一段精修文本。第二段精修文本。",
                     )
                     self.assertEqual(len(_CountingRefiner.calls), calls_before_finish)
+                    self.assertEqual(
+                        final["session_refiner_call_count"], calls_before_finish
+                    )
+                    self.assertEqual(
+                        final["session_refiner_intermediate_call_count"],
+                        calls_before_finish,
+                    )
+                    self.assertEqual(final["session_refiner_final_call_count"], 0)
+
+    def test_online_final_uses_sentence_bounded_window(self) -> None:
+        with (
+            patch.object(web_app, "TransformersRefiner", _CountingRefiner),
+            patch.object(web_app, "_stream_request", _stable_stream_request),
+        ):
+            app = web_app.create_app(
+                Path("/tmp/fake-refiner"),
+                "cpu",
+                "http://fake-asr",
+                "Chinese",
+                32,
+                None,
+            )
+            with TestClient(app) as client:
+                with client.websocket_connect(
+                    "/ws/stream?mode=online"
+                ) as websocket:
+                    self.assertEqual(websocket.receive_json()["event"], "ready")
+                    websocket.send_json({"event": "finish"})
+                    self.assertEqual(websocket.receive_json()["event"], "transcript")
+                    final = websocket.receive_json()
+
+            self.assertEqual(final["event"], "final")
+            self.assertEqual(final["window_size"], 3)
+            self.assertEqual(final["window_max_chars"], 80)
+            self.assertTrue(all(len(call) <= 80 for call in _CountingRefiner.calls))
 
     def test_streaming_cached_result_still_applies_final_fuzzy_entity(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -336,16 +664,57 @@ class WebAppFinishTest(unittest.TestCase):
                     final = websocket.receive_json()
                     self.assertEqual(final["clean_text"], _LONG_COMPLETE_TRANSCRIPT)
                     self.assertTrue(final["refiner_accepted"])
-                    self.assertEqual(final["refiner_retry_count"], 2)
+                    # Sentence-bounded finalization may retry each affected
+                    # short window independently instead of two large blocks.
+                    self.assertGreaterEqual(final["refiner_retry_count"], 2)
                     self.assertEqual(final["placeholder_retry_count"], 0)
                     self.assertIn(
                         "segment_1:severe_content_loss",
                         final["refiner_retry_reasons"],
                     )
-                    self.assertIn(
-                        "segment_2:severe_content_loss",
-                        final["refiner_retry_reasons"],
+                    self.assertGreaterEqual(
+                        final["refiner_retry_reasons"].count(
+                            "segment_1:severe_content_loss"
+                        ),
+                        2,
                     )
+
+    def test_semantic_loss_retries_and_keeps_source_when_needed(self) -> None:
+        with (
+            patch.object(web_app, "TransformersRefiner", _SemanticLossOnceRefiner),
+            patch.object(
+                web_app,
+                "_stream_request",
+                lambda asr_url, endpoint, session_id=None, data=b"", params=None: (
+                    {"session_id": "semantic-loss-test-session"}
+                    if endpoint == "/stream/start"
+                    else (
+                        {"text": "你当我傻？", "language": "Chinese"}
+                        if endpoint == "/stream/finish"
+                        else {"cancelled": True}
+                    )
+                ),
+            ),
+        ):
+            app = web_app.create_app(
+                Path("/tmp/fake-refiner"),
+                "cpu",
+                "http://fake-asr",
+                "Chinese",
+                32,
+                None,
+            )
+            with TestClient(app) as client:
+                with client.websocket_connect("/ws/stream?mode=offline") as websocket:
+                    self.assertEqual(websocket.receive_json()["event"], "ready")
+                    websocket.send_json({"event": "finish"})
+                    websocket.receive_json()
+                    final = websocket.receive_json()
+
+        self.assertEqual(final["clean_text"], "你当我傻？")
+        self.assertTrue(final["refiner_accepted"])
+        self.assertEqual(final["refiner_retry_count"], 1)
+        self.assertIn("segment_1:semantic_substitution", final["refiner_retry_reasons"])
 
     def test_placeholder_failure_retries_once_with_strict_prompt(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -387,6 +756,9 @@ class WebAppFinishTest(unittest.TestCase):
                         self.assertEqual(final["placeholder_retry_count"], 1)
                         self.assertEqual(final["refiner_retry_count"], 1)
                         self.assertEqual(len(final["refiner_masked_outputs"]), 2)
+                        self.assertEqual(final["session_refiner_call_count"], 2)
+                        self.assertEqual(final["session_refiner_initial_call_count"], 1)
+                        self.assertEqual(final["session_refiner_retry_call_count"], 1)
 
     def test_final_auto_mode_applies_and_restores_fuzzy_entity(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -523,6 +895,12 @@ class WebAppFinishTest(unittest.TestCase):
                         "final_refinement_error:RuntimeError",
                         final["refiner_reject_reasons"],
                     )
+                    stats = final["refiner_session_stats"]
+                    self.assertEqual(stats["call_count"], 1)
+                    self.assertEqual(stats["completed_call_count"], 1)
+                    self.assertEqual(stats["failed_call_count"], 1)
+                    self.assertEqual(stats["inflight_call_count"], 0)
+                    self.assertTrue(stats["stats_complete"])
 
 
 if __name__ == "__main__":

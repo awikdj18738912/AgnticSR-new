@@ -37,10 +37,16 @@ from system.entity_pipeline import (
     prepare_entity_segment,
 )
 from system.protection import EntityProtector
+from system.refinement_gate import (
+    RefinementGate,
+    RefinementGateDecision,
+    RefinementGateMode,
+)
 
 SYSTEM_PROMPT = (
     "你是 ASR 文本纠错助手。保留原意，最小修改：去口癖/重复，修错字，补必要标点，"
-    "规范数字、日期、术语和代码符号，处理自我修正。不要总结、扩写或解释。"
+    "处理自我修正。不要总结、扩写或解释。数字、日期、术语和代码符号已由系统规则"
+    "处理，不得自行转换数字，成语中的汉字数字（如三番五次）必须保持原样。"
     "重要易错实体在末尾追加 <KEY>[词1、词2]；没有则不加。"
     "输入中形如 __ENTITY_000__ 的内容是不可编辑的受保护标记；"
     "每个标记必须原样保留一次，不得删除、改写、重复或调整顺序。"
@@ -76,6 +82,7 @@ class RunConfig:
     entity_db: Path | None
     entity_domain: str
     entity_fuzzy_mode: str
+    refinement_gate_mode: str
     model: ModelConfig
 
 
@@ -217,6 +224,11 @@ def parse_args() -> RunConfig:
         choices=[mode.value for mode in EntityFuzzyMode],
         default="shadow",
     )
+    parser.add_argument(
+        "--refinement-gate-mode",
+        choices=[mode.value for mode in RefinementGateMode],
+        default="off",
+    )
     args = parser.parse_args()
     if args.batch_size < 1:
         parser.error("--batch-size must be at least 1")
@@ -236,6 +248,7 @@ def parse_args() -> RunConfig:
         entity_db=args.entity_db.resolve() if args.entity_db else None,
         entity_domain=args.entity_domain.strip(),
         entity_fuzzy_mode=args.entity_fuzzy_mode,
+        refinement_gate_mode=args.refinement_gate_mode,
         model=ModelConfig(
             model_path=args.model,
             device_map=args.device_map,
@@ -280,6 +293,22 @@ def _pending_records(config: RunConfig) -> list[JsonObject]:
     return pending[: config.limit] if config.limit is not None else pending
 
 
+def _record_asr_confidence(record: JsonObject) -> float | None:
+    """Read common confidence locations without changing the input contract."""
+
+    output = record.get("output")
+    values = [record.get("asr_confidence")]
+    if isinstance(output, dict):
+        values.extend((output.get("asr_confidence"), output.get("confidence")))
+    for value in values:
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            continue
+        confidence = float(value)
+        if 0 <= confidence <= 1:
+            return confidence
+    return None
+
+
 def run(config: RunConfig) -> int:
     if config.input_path == config.output_path:
         raise PostprocessError("Input and output paths must be different")
@@ -320,26 +349,37 @@ def run(config: RunConfig) -> int:
         if definitions and fuzzy_mode is not EntityFuzzyMode.OFF
         else None
     )
+    refinement_gate = RefinementGate(config.refinement_gate_mode)
     processor = TransformersPostprocessor(config.model) if valid_records else None
     for offset in range(0, len(pending), config.batch_size):
         batch = pending[offset : offset + config.batch_size]
         batch_inputs: list[str] = []
         batch_hints: list[tuple[str, ...]] = []
         batch_prepared: list[PreparedEntitySegment] = []
+        batch_gate_decisions: list[RefinementGateDecision] = []
         for record in batch:
             try:
                 raw_text = extract_raw_text(record)
             except PostprocessError:
                 continue
+            asr_confidence = _record_asr_confidence(record)
             prepared = prepare_entity_segment(
                 raw_text,
                 protector,
                 matcher,
                 allow_auto=True,
+                confidence=asr_confidence,
             )
-            batch_inputs.append(prepared.protection.masked_text)
-            batch_hints.append(prepared.hints)
             batch_prepared.append(prepared)
+            gate_decision = refinement_gate.decide(
+                prepared.baseline_text,
+                asr_confidence=asr_confidence,
+                entity_hints=prepared.hints,
+            )
+            batch_gate_decisions.append(gate_decision)
+            if gate_decision.should_refine:
+                batch_inputs.append(prepared.protection.masked_text)
+                batch_hints.append(prepared.hints)
         generated_texts: list[str] = []
         latency_ms = 0.0
         if batch_inputs:
@@ -353,6 +393,7 @@ def run(config: RunConfig) -> int:
             generated_texts, latency_ms = processor.generate(batch_inputs, batch_hints)
         generated_iterator = iter(generated_texts)
         prepared_iterator = iter(batch_prepared)
+        gate_iterator = iter(batch_gate_decisions)
         outcomes: list[InferenceOutcome] = []
         for record in batch:
             try:
@@ -363,10 +404,50 @@ def run(config: RunConfig) -> int:
                         None,
                         0.0,
                         "input_error: missing non-empty output.raw_text",
+                        refiner_executed=False,
+                        refinement_gate_mode=refinement_gate.mode.value,
+                        refinement_gate_config=refinement_gate.config_dict(),
                     )
                 )
             else:
                 prepared = next(prepared_iterator)
+                gate_decision = next(gate_iterator)
+                gate_metadata = (gate_decision.public_dict(),)
+                if not gate_decision.should_refine:
+                    outcomes.append(
+                        InferenceOutcome(
+                            prepared.baseline_text,
+                            0.0,
+                            None,
+                            refiner_accepted=True,
+                            protected_entities=tuple(
+                                span.public_dict()
+                                for span in prepared.protection.spans
+                            ),
+                            entity_candidates=tuple(
+                                match.public_dict()
+                                for match in prepared.report.matches
+                            ),
+                            entity_normalizations=prepared.normalizations,
+                            entity_refinement_hints=prepared.hints,
+                            entity_audit_issues=protector.audit_unmasked(
+                                prepared.baseline_text, prepared.protection
+                            ),
+                            entity_matcher_latency_ms=round(
+                                prepared.report.matcher_latency_ms, 3
+                            ),
+                            entity_fuzzy_mode=fuzzy_mode.value,
+                            entity_matching_config_version=(
+                                matcher.config.version if matcher is not None else None
+                            ),
+                            refiner_executed=False,
+                            refinement_gate_mode=refinement_gate.mode.value,
+                            refinement_gate_config=refinement_gate.config_dict(),
+                            refinement_gate_decisions=gate_metadata,
+                            refinement_gate_skipped_segments=1,
+                        )
+                    )
+                    continue
                 refined_text = next(generated_iterator)
                 refiner_masked_outputs = [refined_text]
                 finalized = finalize_entity_segment(
@@ -423,6 +504,10 @@ def run(config: RunConfig) -> int:
                         refiner_retry_count=refiner_retry_count,
                         refiner_retry_reasons=refiner_retry_reasons,
                         refiner_masked_outputs=tuple(refiner_masked_outputs),
+                        refiner_executed=True,
+                        refinement_gate_mode=refinement_gate.mode.value,
+                        refinement_gate_config=refinement_gate.config_dict(),
+                        refinement_gate_decisions=gate_metadata,
                     )
                 )
         _append_records(

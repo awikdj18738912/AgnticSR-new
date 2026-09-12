@@ -11,7 +11,8 @@ from .chunking import Chunk
 
 SYSTEM_PROMPT = (
     "你是 ASR 文本纠错助手。保留原意，最小修改：去口癖/重复，修错字，补必要标点，"
-    "规范数字、日期、术语和代码符号，处理自我修正。不要总结、扩写或解释。"
+    "处理自我修正。不要总结、扩写或解释。数字、日期、术语和代码符号已由系统规则"
+    "处理，不得自行转换数字，成语中的汉字数字（如三番五次）必须保持原样。"
     "重要易错实体在末尾追加 <KEY>[词1、词2]；没有则不加。"
     "输入中形如 __ENTITY_000__ 的受保护标记必须在输出中原样保留一次，"
     "不得删除、改写、重复或调整顺序。"
@@ -38,11 +39,19 @@ class RefinementUpdate:
 class StreamingRefinementSession:
     """Replace the active source window with one refined text string."""
 
-    def __init__(self, refiner: TextRefiner, window_size: int = 3) -> None:
+    def __init__(
+        self,
+        refiner: TextRefiner,
+        window_size: int = 3,
+        window_max_chars: int = 80,
+    ) -> None:
         if window_size < 1:
             raise ValueError("window_size must be at least 1")
+        if window_max_chars < 1:
+            raise ValueError("window_max_chars must be at least 1")
         self.refiner = refiner
         self.window_size = window_size
+        self.window_max_chars = window_max_chars
         self.raw_chunks: list[str] = []
         self._committed_text: list[str] = []
         self._active_text = ""
@@ -58,7 +67,7 @@ class StreamingRefinementSession:
             raise ValueError("chunk text must not be empty")
 
         self.raw_chunks.append(text)
-        start = max(0, len(self.raw_chunks) - self.window_size)
+        start = self._active_start()
         raw_window = self.raw_chunks[start:]
 
         started = time.perf_counter()
@@ -81,6 +90,21 @@ class StreamingRefinementSession:
         if not isinstance(refined, str):
             raise ValueError("refiner must return one text string")
         return refined.strip()
+
+    def _active_start(self) -> int:
+        """Keep the latest sentence chunks within count and char limits."""
+
+        start = len(self.raw_chunks)
+        total_chars = 0
+        active_count = 0
+        while start > 0 and active_count < self.window_size:
+            candidate_chars = len(self.raw_chunks[start - 1])
+            if active_count and total_chars + candidate_chars > self.window_max_chars:
+                break
+            start -= 1
+            total_chars += candidate_chars
+            active_count += 1
+        return start
 
 
 class IdentityRefiner:
