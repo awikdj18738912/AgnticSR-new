@@ -1,0 +1,20 @@
+Loading AgenticASR Refiner...
+Loading weights:   0%|          | 0/219 [00:00<?, ?it/s]Loading weights:   1%|          | 2/219 [00:00<00:11, 19.26it/s]Loading weights:  35%|███▍      | 76/219 [00:00<00:00, 435.47it/s]Loading weights:  69%|██████▉   | 151/219 [00:00<00:00, 577.54it/s]Loading weights: 100%|██████████| 219/219 [00:00<00:00, 562.00it/s]
+INFO:     Started server process [521551]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://127.0.0.1:8081 (Press CTRL+C to quit)
+INFO:     127.0.0.1:54058 - "GET /api/entities HTTP/1.1" 200 OK
+INFO:     127.0.0.1:52410 - "WebSocket /ws/stream?language=Chinese&mode=streaming&domain=general" [accepted]
+INFO:     connection open
+INFO:     127.0.0.1:55642 - "GET /api/entities HTTP/1.1" 200 OK
+INFO:     127.0.0.1:57086 - "GET / HTTP/1.1" 200 OK
+INFO:     127.0.0.1:57086 - "GET /favicon.ico HTTP/1.1" 404 Not Found
+INFO:     127.0.0.1:57110 - "GET / HTTP/1.1" 200 OK
+INFO:     127.0.0.1:57110 - "GET /favicon.ico HTTP/1.1" 404 Not Found
+INFO:     127.0.0.1:38148 - "WebSocket /ws/stream?language=Chinese&mode=streaming&domain=general" [accepted]
+INFO:     connection open
+INFO:     127.0.0.1:33554 - "WebSocket /ws/stream?language=Chinese&mode=streaming&domain=general" [accepted]
+INFO:     connection open
+INFO:     127.0.0.1:46624 - "WebSocket /ws/stream?language=Chinese&mode=streaming&domain=general" [accepted]
+INFO:     connection open
