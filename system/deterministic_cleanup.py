@@ -11,15 +11,43 @@ _TERMINAL_BOUNDARY_RE = re.compile(r"([。！？!?\uff1b;\n]+\s*)$")
 _COMMA_RE = re.compile(r"([，,])")
 _VISIBLE_RE = re.compile(r"[\w\u3400-\u9fff]", re.UNICODE)
 _PRONOUN_STUTTER_RE = re.compile(r"([我你您他她它这那])\1+")
+_COMMA_SUFFIX_UTTERANCE_REPEAT_RE = re.compile(
+    r"(?P<separator>[，,])"
+    r"(?P<item>[\w\u3400-\u9fff]{1,8})"
+    r"(?P<ending>[。！？!?；;])"
+    r"(?:\s*(?P=item)[。！？!?；;])+"
+)
 
 
 def clean_transcript_deterministically(text: str) -> str:
     """Apply only exact, low-ambiguity cleanup rules to refined text."""
 
     return collapse_repeated_short_utterances(
-        collapse_repeated_comma_items(
-            collapse_repeated_pronoun_stutters(text)
+        collapse_comma_suffix_utterance_repetitions(
+            collapse_repeated_comma_items(
+                collapse_repeated_pronoun_stutters(text)
+            )
         )
+    )
+
+
+def collapse_comma_suffix_utterance_repetitions(text: str) -> str:
+    """Collapse a comma-final item repeated as the next short utterance.
+
+    In ``李飞雪，可恶！可恶！`` the first ``可恶`` belongs to a
+    longer sentence according to sentence splitting, even though it is the
+    same adjacent exclamation as the second one. Match only an entire compact
+    comma suffix followed by exact standalone repetitions, preserving the
+    first occurrence and its punctuation.
+    """
+
+    return _COMMA_SUFFIX_UTTERANCE_REPEAT_RE.sub(
+        lambda match: (
+            match.group("separator")
+            + match.group("item")
+            + match.group("ending")
+        ),
+        text,
     )
 
 

@@ -4,6 +4,7 @@ import unittest
 
 from system.deterministic_cleanup import (
     clean_transcript_deterministically,
+    collapse_comma_suffix_utterance_repetitions,
     collapse_repeated_comma_items,
     collapse_repeated_short_utterances,
 )
@@ -27,6 +28,19 @@ class DeterministicCleanupTest(unittest.TestCase):
             collapse_repeated_short_utterances("快跑！快跑！"),
             "快跑！",
         )
+
+    def test_comma_suffix_repeated_as_next_utterance_collapses(self) -> None:
+        self.assertEqual(
+            collapse_comma_suffix_utterance_repetitions(
+                "李飞雪，可恶！可恶！看，掘地三尺。"
+            ),
+            "李飞雪，可恶！看，掘地三尺。",
+        )
+
+    def test_nonmatching_comma_suffix_utterances_are_preserved(self) -> None:
+        source = "李飞雪，可恶！快跑！看，掘地三尺。"
+
+        self.assertEqual(collapse_comma_suffix_utterance_repetitions(source), source)
 
     def test_comma_separated_short_repetitions_collapse_to_one(self) -> None:
         self.assertEqual(
