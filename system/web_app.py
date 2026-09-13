@@ -11,6 +11,7 @@ import threading
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections import OrderedDict
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -32,6 +33,7 @@ from .entity_pipeline import (
 from .protection import EntityProtector
 from .refinement_gate import RefinementGate, RefinementGateMode
 from .refinement_guard import join_refined_segments, split_for_refinement
+from .refinement_scheduler import StableTextRefinementScheduler
 from .numeric_normalizer import ContextualNumericNormalizer
 from .window_refinement import CumulativeWindowRefinement
 from .session_memory import SessionEntityMemory
@@ -43,6 +45,7 @@ WEB_DIR = Path(__file__).resolve().parent / "web"
 # Keep short early hypotheses responsive, then perform one complete refinement
 # when the client sends ``finish``.
 STREAMING_INTERMEDIATE_MAX_CHARS = 240
+STREAMING_UNSTABLE_SCHEDULE_CHARS = 80
 REFINER_LOCK_TIMEOUT_SECONDS = 30.0
 FINAL_REFINEMENT_TIMEOUT_SECONDS = 30.0
 # Long recordings are refined one bounded segment at a time.  Give the final
@@ -76,6 +79,34 @@ class _RefinerCallsClosed(RuntimeError):
     """Raised when a timed-out/disconnected session forbids new model calls."""
 
 
+class _RefinerResultCache:
+    """Bounded cache for deterministic Refiner generations."""
+
+    def __init__(self, capacity: int = 512) -> None:
+        self.capacity = capacity
+        self._items: OrderedDict[
+            tuple[str, tuple[str, ...], bool], tuple[str, float]
+        ] = OrderedDict()
+
+    def get(
+        self, key: tuple[str, tuple[str, ...], bool]
+    ) -> tuple[str, float] | None:
+        result = self._items.get(key)
+        if result is not None:
+            self._items.move_to_end(key)
+        return result
+
+    def put(
+        self,
+        key: tuple[str, tuple[str, ...], bool],
+        result: tuple[str, float],
+    ) -> None:
+        self._items[key] = result
+        self._items.move_to_end(key)
+        while len(self._items) > self.capacity:
+            self._items.popitem(last=False)
+
+
 class _RefinerSessionStats:
     """Thread-safe accounting for every real Refiner invocation in one socket."""
 
@@ -92,6 +123,8 @@ class _RefinerSessionStats:
         self._inflight_call_count = 0
         self._completed_wall_latency_ms = 0.0
         self._gate_skipped_segment_count = 0
+        self._stream_deferred_update_count = 0
+        self._refiner_cache_hit_count = 0
         self._busy_segment_count = 0
         self._closed_call_rejection_count = 0
 
@@ -128,6 +161,14 @@ class _RefinerSessionStats:
         with self._lock:
             self._gate_skipped_segment_count += 1
 
+    def record_stream_defer(self) -> None:
+        with self._lock:
+            self._stream_deferred_update_count += 1
+
+    def record_cache_hit(self) -> None:
+        with self._lock:
+            self._refiner_cache_hit_count += 1
+
     def record_busy_segment(self) -> None:
         with self._lock:
             self._busy_segment_count += 1
@@ -159,6 +200,13 @@ class _RefinerSessionStats:
                     self._completed_wall_latency_ms, 3
                 ),
                 "gate_skipped_segment_count": self._gate_skipped_segment_count,
+                "stream_deferred_update_count": self._stream_deferred_update_count,
+                "refiner_cache_hit_count": self._refiner_cache_hit_count,
+                "avoided_refiner_opportunity_count": (
+                    self._gate_skipped_segment_count
+                    + self._stream_deferred_update_count
+                    + self._refiner_cache_hit_count
+                ),
                 "busy_segment_count": self._busy_segment_count,
                 "closed_call_rejection_count": self._closed_call_rejection_count,
                 "observed_initial_opportunity_count": observed_opportunities,
@@ -289,6 +337,7 @@ def create_app(
     print("Loading AgenticASR Refiner...", flush=True)
     refiner = TransformersRefiner(refiner_model, refiner_device, max_new_tokens)
     refiner_lock = threading.Lock()
+    refiner_result_cache = _RefinerResultCache()
     entity_store = EntityStore(entity_db) if entity_db is not None else None
     fuzzy_mode = EntityFuzzyMode.parse(entity_fuzzy_mode)
     refinement_gate = RefinementGate(refinement_gate_mode)
@@ -321,7 +370,13 @@ def create_app(
             *,
             hints: tuple[str, ...],
             strict_placeholders: bool = False,
-        ) -> tuple[str, float]:
+        ) -> tuple[str, float, bool]:
+            cache_key = (text, hints, strict_placeholders)
+            cached = refiner_result_cache.get(cache_key)
+            if cached is not None:
+                if call_stats is not None:
+                    call_stats.record_cache_hit()
+                return cached[0], 0.0, True
             started_at = (
                 call_stats.begin_call(final=final, retry=strict_placeholders)
                 if call_stats is not None
@@ -343,7 +398,8 @@ def create_app(
                 raise
             if call_stats is not None:
                 call_stats.finish_call(started_at, failed=False)
-            return result
+            refiner_result_cache.put(cache_key, result)
+            return result[0], result[1], False
 
         clean_parts: list[str] = []
         protected_entities: list[dict[str, str]] = []
@@ -365,8 +421,9 @@ def create_app(
         refiner_available = True
         segments = (raw_text,) if single_window and raw_text else split_for_refinement(raw_text)
         for segment_index, segment in enumerate(segments):
+            rule_cleaned_segment = clean_transcript_deterministically(segment)
             prepared = prepare_entity_segment(
-                segment,
+                rule_cleaned_segment,
                 protector,
                 matcher,
                 allow_auto=final,
@@ -400,9 +457,11 @@ def create_app(
                 ),
                 entity_hints=hints,
             )
-            refinement_gate_decisions.append(
-                {"segment_index": segment_index + 1, **gate_decision.public_dict()}
-            )
+            refinement_gate_decisions.append({
+                "segment_index": segment_index + 1,
+                "deterministic_cleanup_applied": rule_cleaned_segment != segment,
+                **gate_decision.public_dict(),
+            })
             if not gate_decision.should_refine:
                 refinement_gate_skipped_segments += 1
                 if call_stats is not None:
@@ -448,12 +507,12 @@ def create_app(
                     f"segment_{segment_index + 1}:refiner_busy"
                 )
             else:
-                refiner_executed = True
                 try:
-                    refined_candidate, latency_ms = invoke_refiner(
+                    refined_candidate, latency_ms, cache_hit = invoke_refiner(
                         masked_text,
                         hints=hints,
                     )
+                    refiner_executed = refiner_executed or not cache_hit
                     total_latency_ms += latency_ms
                     refiner_masked_outputs.append(refined_candidate)
                     finalized = finalize_entity_segment(
@@ -461,11 +520,12 @@ def create_app(
                     )
                     if has_retryable_integrity_failure(finalized.reject_reasons):
                         initial_reasons = finalized.reject_reasons
-                        retry_candidate, retry_latency_ms = invoke_refiner(
+                        retry_candidate, retry_latency_ms, retry_cache_hit = invoke_refiner(
                             masked_text,
                             hints=hints,
                             strict_placeholders=True,
                         )
+                        refiner_executed = refiner_executed or not retry_cache_hit
                         refiner_retry_count += 1
                         if has_placeholder_failure(initial_reasons):
                             placeholder_retry_count += 1
@@ -760,6 +820,9 @@ def create_app(
         asr_activity: dict[str, object] = {}
         session_memory = SessionEntityMemory()
         refiner_session_stats = _RefinerSessionStats()
+        refinement_scheduler = StableTextRefinementScheduler(
+            max_unstable_chars=STREAMING_UNSTABLE_SCHEDULE_CHARS
+        )
 
         def attach_refiner_session_stats(
             result: dict[str, object], *, close: bool = False
@@ -784,6 +847,15 @@ def create_app(
             ]
             result["session_gate_skipped_segment_count"] = snapshot[
                 "gate_skipped_segment_count"
+            ]
+            result["session_stream_deferred_update_count"] = snapshot[
+                "stream_deferred_update_count"
+            ]
+            result["session_gate_avoided_refiner_count"] = snapshot[
+                "avoided_refiner_opportunity_count"
+            ]
+            result["session_refiner_cache_hit_count"] = snapshot[
+                "refiner_cache_hit_count"
             ]
             return result
 
@@ -1016,6 +1088,44 @@ def create_app(
             )
             if streaming_refiner_task is None or streaming_refiner_task.done():
                 streaming_refiner_task = asyncio.create_task(run_streaming_refiner())
+
+        async def publish_transcript_and_schedule(
+            raw_text: str,
+            language_value: str | None,
+            asr_confidence: float | None,
+            confidence_metadata: dict[str, object],
+        ) -> bool:
+            schedule = refinement_scheduler.decide(raw_text)
+            if not schedule.should_refine:
+                refiner_session_stats.record_stream_defer()
+            message: dict[str, object] = {
+                "event": "transcript",
+                "raw_text": raw_text,
+                "asr_language": language_value,
+                "asr_confidence": asr_confidence,
+                "asr_confidence_metadata": confidence_metadata,
+                "refiner_deferred": False,
+                "refiner_update_deferred": not schedule.should_refine,
+                "refinement_schedule_decision": schedule.public_dict(),
+            }
+            attach_refiner_session_stats(message)
+            if not await send_json(message):
+                return False
+            if schedule.should_refine:
+                scheduled_text = schedule.text
+                tail_start = max(
+                    0, len(scheduled_text) - STREAMING_INTERMEDIATE_MAX_CHARS
+                )
+                queue_streaming_refinement(
+                    scheduled_text[tail_start:],
+                    language_value,
+                    asr_confidence,
+                    confidence_metadata,
+                    scheduled_text,
+                    tail_start,
+                )
+            return True
+
         async def refine_final(
             raw_text: str,
             detected_language: str | None,
@@ -1296,28 +1406,13 @@ def create_app(
                             if isinstance(detected_language, str)
                             else None
                         )
-                        if not await send_json(
-                            {
-                                "event": "transcript",
-                                "raw_text": raw_text,
-                                "asr_language": language_value,
-                                "asr_confidence": asr_confidence,
-                                "asr_confidence_metadata": confidence_metadata,
-                                "refiner_deferred": False,
-                            }
-                        ):
-                            break
-                        tail_start = max(
-                            0, len(raw_text) - STREAMING_INTERMEDIATE_MAX_CHARS
-                        )
-                        queue_streaming_refinement(
-                            raw_text[tail_start:],
+                        if not await publish_transcript_and_schedule(
+                            raw_text,
                             language_value,
                             asr_confidence,
                             confidence_metadata,
-                            raw_text,
-                            tail_start,
-                        )
+                        ):
+                            break
                     continue
                 payload, chunk_index = await process_audio_chunk(audio)
                 if requested_mode == "streaming":
@@ -1334,28 +1429,13 @@ def create_app(
                         detected_language if isinstance(detected_language, str) else None
                     )
                     if requested_mode in {"online", "streaming"}:
-                        if not await send_json(
-                            {
-                                "event": "transcript",
-                                "raw_text": raw_text,
-                                "asr_language": language_value,
-                                "asr_confidence": asr_confidence,
-                                "asr_confidence_metadata": confidence_metadata,
-                                "refiner_deferred": False,
-                            }
-                        ):
-                            break
-                        tail_start = max(
-                            0, len(raw_text) - STREAMING_INTERMEDIATE_MAX_CHARS
-                        )
-                        queue_streaming_refinement(
-                            raw_text[tail_start:],
+                        if not await publish_transcript_and_schedule(
+                            raw_text,
                             language_value,
                             asr_confidence,
                             confidence_metadata,
-                            raw_text,
-                            tail_start,
-                        )
+                        ):
+                            break
                     else:
                         if not await send_json(
                             attach_refiner_session_stats(

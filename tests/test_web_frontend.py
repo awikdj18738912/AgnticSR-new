@@ -14,6 +14,9 @@ class WebFrontendMetricsTests(unittest.TestCase):
         self.assertIn("function updateSessionMetrics(data)", html)
         self.assertIn("stats.call_count", html)
         self.assertIn("stats.gate_skipped_segment_count", html)
+        self.assertIn("stats.stream_deferred_update_count", html)
+        self.assertIn("stats.avoided_refiner_opportunity_count", html)
+        self.assertIn("stats.refiner_cache_hit_count", html)
         self.assertIn("updateSessionMetrics(data);", html)
 
 

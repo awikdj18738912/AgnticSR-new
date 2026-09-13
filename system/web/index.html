@@ -135,9 +135,9 @@
         <small>包含首次调用和安全重试</small>
       </div>
       <div>
-        <dt>门控跳过次数</dt>
+        <dt>门控避免模型调用</dt>
         <dd><span id="gate-skip-count" class="metric-value">0</span><span class="metric-unit">次</span></dd>
-        <small>按跳过的精修句块累计</small>
+        <small id="gate-skip-detail">句块跳过 0 · 流式延后 0 · 缓存复用 0</small>
       </div>
     </dl>
     <dl class="refiner-status" aria-label="精修执行状态">
@@ -215,6 +215,7 @@
     const refinerType = document.querySelector('#refiner-type');
     const refinerCallCount = document.querySelector('#refiner-call-count');
     const gateSkipCount = document.querySelector('#gate-skip-count');
+    const gateSkipDetail = document.querySelector('#gate-skip-detail');
     const historyCount = document.querySelector('#history-count');
     const historyEmpty = document.querySelector('#history-empty');
     const refinementList = document.querySelector('#refinement-list');
@@ -356,6 +357,7 @@
       refinerType.textContent = '—';
       refinerCallCount.textContent = '0';
       gateSkipCount.textContent = '0';
+      gateSkipDetail.textContent = '句块跳过 0 · 流式延后 0 · 缓存复用 0';
     }
 
     function updateSessionMetrics(data) {
@@ -363,9 +365,15 @@
         ? data.refiner_session_stats
         : null;
       const calls = stats ? Number(stats.call_count) : Number(data.session_refiner_call_count);
-      const skips = stats ? Number(stats.gate_skipped_segment_count) : Number(data.session_gate_skipped_segment_count);
+      const segmentSkips = stats ? Number(stats.gate_skipped_segment_count) : Number(data.session_gate_skipped_segment_count);
+      const deferredUpdates = stats ? Number(stats.stream_deferred_update_count) : Number(data.session_stream_deferred_update_count);
+      const cacheHits = stats ? Number(stats.refiner_cache_hit_count) : Number(data.session_refiner_cache_hit_count);
+      const avoided = stats ? Number(stats.avoided_refiner_opportunity_count) : Number(data.session_gate_avoided_refiner_count);
       if (Number.isFinite(calls) && calls >= 0) refinerCallCount.textContent = String(Math.trunc(calls));
-      if (Number.isFinite(skips) && skips >= 0) gateSkipCount.textContent = String(Math.trunc(skips));
+      if (Number.isFinite(avoided) && avoided >= 0) gateSkipCount.textContent = String(Math.trunc(avoided));
+      if (Number.isFinite(segmentSkips) && Number.isFinite(deferredUpdates) && Number.isFinite(cacheHits)) {
+        gateSkipDetail.textContent = `句块跳过 ${Math.trunc(segmentSkips)} · 流式延后 ${Math.trunc(deferredUpdates)} · 缓存复用 ${Math.trunc(cacheHits)}`;
+      }
     }
 
     function refinementStageLabel(data) {

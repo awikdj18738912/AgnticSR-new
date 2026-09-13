@@ -71,6 +71,23 @@ class RefinementGuardTest(unittest.TestCase):
             reject_reasons(raw, "你好，我有一个香蕉，我有2135元。"),
         )
 
+    def test_numeric_surface_change_keeps_self_correction_tail(self) -> None:
+        raw = (
+            "我叫厉飞宇，来自鬼灵门。然后我有一箱苹果，嗯，"
+            "不对我有一箱梨。然后我觉得今天的天气过得还好，"
+        )
+        refined = "我叫厉飞羽，来自鬼灵门。然后我有1箱梨。然后我觉得今天的天气过得还好。"
+
+        self.assertEqual(reject_reasons(raw, refined), ())
+
+    def test_changed_numeric_value_in_self_correction_tail_is_rejected(self) -> None:
+        reasons = reject_reasons(
+            "我有一箱苹果，不对我有一箱梨。",
+            "我有2箱梨。",
+        )
+
+        self.assertIn("numeric_value_mismatch", reasons)
+
     def test_numeric_value_change_is_rejected(self) -> None:
         reasons = reject_reasons(
             "我有两千一百三十五元。",

@@ -297,6 +297,48 @@ def _numeric_stream_request(
     raise AssertionError(f"unexpected endpoint: {endpoint}")
 
 
+def _repeated_short_stream_request(
+    asr_url: str,
+    endpoint: str,
+    session_id: str | None = None,
+    data: bytes = b"",
+    params: dict[str, str] | None = None,
+) -> dict[str, object]:
+    if endpoint == "/stream/start":
+        return {"session_id": "repeated-short-test-session"}
+    if endpoint == "/stream/finish":
+        return {"text": "少主，少主，少主！", "language": "Chinese"}
+    if endpoint == "/stream/cancel":
+        return {"cancelled": True}
+    raise AssertionError(f"unexpected endpoint: {endpoint}")
+
+
+class _PartialRevisionStream:
+    def __init__(self) -> None:
+        self.chunk_index = 0
+
+    def __call__(
+        self,
+        asr_url: str,
+        endpoint: str,
+        session_id: str | None = None,
+        data: bytes = b"",
+        params: dict[str, str] | None = None,
+    ) -> dict[str, object]:
+        if endpoint == "/stream/start":
+            return {"session_id": "partial-revision-test-session"}
+        if endpoint == "/stream/chunk":
+            texts = ("今天", "今天天气", "今天天气很好")
+            text = texts[min(self.chunk_index, len(texts) - 1)]
+            self.chunk_index += 1
+            return {"text": text, "language": "Chinese"}
+        if endpoint == "/stream/finish":
+            return {"text": "今天天气很好。", "language": "Chinese"}
+        if endpoint == "/stream/cancel":
+            return {"cancelled": True}
+        raise AssertionError(f"unexpected endpoint: {endpoint}")
+
+
 @unittest.skipIf(web_app is None, "FastAPI is not installed")
 class WebAppFinishTest(unittest.TestCase):
     def test_numeric_text_reaches_refiner_normalized_without_placeholders(self) -> None:
@@ -387,6 +429,110 @@ class WebAppFinishTest(unittest.TestCase):
                 final["refiner_session_stats"]["gate_skipped_segment_count"], 1
             )
             self.assertTrue(final["refiner_session_stats"]["stats_complete"])
+
+    def test_deterministic_cleanup_runs_before_conservative_gate(self) -> None:
+        with (
+            patch.object(web_app, "TransformersRefiner", _CountingRefiner),
+            patch.object(
+                web_app, "_stream_request", _repeated_short_stream_request
+            ),
+        ):
+            app = web_app.create_app(
+                Path("/tmp/fake-refiner"),
+                "cpu",
+                "http://fake-asr",
+                "Chinese",
+                32,
+                None,
+                None,
+                "shadow",
+                "conservative",
+            )
+            with TestClient(app) as client:
+                with client.websocket_connect("/ws/stream?mode=online") as websocket:
+                    self.assertEqual(websocket.receive_json()["event"], "ready")
+                    websocket.send_json({"event": "finish"})
+                    websocket.receive_json()
+                    final = websocket.receive_json()
+
+        self.assertEqual(final["clean_text"], "少主！")
+        self.assertEqual(final["session_refiner_call_count"], 0)
+        self.assertEqual(final["refinement_gate_skipped_segments"], 1)
+        self.assertTrue(
+            final["refinement_gate_decisions"][0][
+                "deterministic_cleanup_applied"
+            ]
+        )
+
+    def test_partial_streaming_revisions_are_deferred_until_final(self) -> None:
+        partial_stream = _PartialRevisionStream()
+        with (
+            patch.object(web_app, "TransformersRefiner", _CountingRefiner),
+            patch.object(web_app, "_stream_request", partial_stream),
+        ):
+            app = web_app.create_app(
+                Path("/tmp/fake-refiner"),
+                "cpu",
+                "http://fake-asr",
+                "Chinese",
+                32,
+                None,
+            )
+            with TestClient(app) as client:
+                with client.websocket_connect(
+                    "/ws/stream?mode=streaming"
+                ) as websocket:
+                    self.assertEqual(websocket.receive_json()["event"], "ready")
+                    for expected_deferred in range(1, 4):
+                        websocket.send_bytes(b"pcm")
+                        self.assertEqual(websocket.receive_json()["event"], "chunk_ack")
+                        transcript = websocket.receive_json()
+                        self.assertTrue(transcript["refiner_update_deferred"])
+                        self.assertEqual(
+                            transcript["session_stream_deferred_update_count"],
+                            expected_deferred,
+                        )
+                    self.assertEqual(_CountingRefiner.calls, [])
+
+                    websocket.send_json({"event": "finish"})
+                    self.assertEqual(websocket.receive_json()["event"], "transcript")
+                    final = websocket.receive_json()
+
+        self.assertEqual(final["clean_text"], "今天天气很好。")
+        self.assertEqual(final["session_refiner_call_count"], 1)
+        self.assertEqual(final["session_stream_deferred_update_count"], 3)
+        self.assertEqual(final["session_gate_avoided_refiner_count"], 3)
+
+    def test_identical_deterministic_generation_is_reused_across_sessions(self) -> None:
+        with (
+            patch.object(web_app, "TransformersRefiner", _CountingRefiner),
+            patch.object(web_app, "_stream_request", _fake_stream_request),
+        ):
+            app = web_app.create_app(
+                Path("/tmp/fake-refiner"),
+                "cpu",
+                "http://fake-asr",
+                "Chinese",
+                32,
+                None,
+            )
+            finals = []
+            with TestClient(app) as client:
+                for _ in range(2):
+                    with client.websocket_connect(
+                        "/ws/stream?mode=online"
+                    ) as websocket:
+                        self.assertEqual(websocket.receive_json()["event"], "ready")
+                        websocket.send_json({"event": "finish"})
+                        websocket.receive_json()
+                        finals.append(websocket.receive_json())
+
+        self.assertEqual(finals[0]["clean_text"], finals[1]["clean_text"])
+        self.assertEqual(finals[0]["session_refiner_call_count"], 1)
+        self.assertEqual(finals[1]["session_refiner_call_count"], 0)
+        self.assertFalse(finals[1]["refiner_executed"])
+        self.assertEqual(finals[1]["session_refiner_cache_hit_count"], 1)
+        self.assertEqual(finals[1]["session_gate_avoided_refiner_count"], 1)
 
     def test_conservative_gate_uses_only_calibrated_full_text_confidence(self) -> None:
         with (
@@ -488,7 +634,7 @@ class WebAppFinishTest(unittest.TestCase):
             self.assertEqual(final["session_refiner_initial_call_count"], 1)
             self.assertEqual(final["session_refiner_retry_call_count"], 0)
 
-    def test_offline_mode_reuses_completed_window_refinement(self) -> None:
+    def test_offline_mode_defers_last_sentence_until_final(self) -> None:
         with (
             patch.object(web_app, "TransformersRefiner", _CountingRefiner),
             patch.object(web_app, "_stream_request", _stable_stream_request),
@@ -522,15 +668,17 @@ class WebAppFinishTest(unittest.TestCase):
                         final["clean_text"],
                         "第一段精修文本。第二段精修文本。",
                     )
-                    self.assertEqual(len(_CountingRefiner.calls), calls_before_finish)
                     self.assertEqual(
-                        final["session_refiner_call_count"], calls_before_finish
+                        len(_CountingRefiner.calls), calls_before_finish + 1
+                    )
+                    self.assertEqual(
+                        final["session_refiner_call_count"], calls_before_finish + 1
                     )
                     self.assertEqual(
                         final["session_refiner_intermediate_call_count"],
                         calls_before_finish,
                     )
-                    self.assertEqual(final["session_refiner_final_call_count"], 0)
+                    self.assertEqual(final["session_refiner_final_call_count"], 1)
 
     def test_online_final_uses_sentence_bounded_window(self) -> None:
         with (
@@ -559,7 +707,7 @@ class WebAppFinishTest(unittest.TestCase):
             self.assertEqual(final["window_max_chars"], 80)
             self.assertTrue(all(len(call) <= 80 for call in _CountingRefiner.calls))
 
-    def test_streaming_cached_result_still_applies_final_fuzzy_entity(self) -> None:
+    def test_streaming_final_applies_fuzzy_entity_after_intermediate_defer(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             entity_db = Path(directory) / "entities.db"
             EntityStore(entity_db).upsert_entity(
@@ -587,12 +735,10 @@ class WebAppFinishTest(unittest.TestCase):
                     ) as websocket:
                         self.assertEqual(websocket.receive_json()["event"], "ready")
                         websocket.send_bytes(b"pcm")
+                        self.assertEqual(websocket.receive_json()["event"], "chunk_ack")
                         message = websocket.receive_json()
-                        while message["event"] != "update":
-                            message = websocket.receive_json()
-                        self.assertEqual(
-                            message["clean_text"], "鬼灵们是这个副本的入口。"
-                        )
+                        self.assertEqual(message["event"], "transcript")
+                        self.assertTrue(message["refiner_update_deferred"])
 
                         websocket.send_json({"event": "finish"})
                         self.assertEqual(websocket.receive_json()["event"], "transcript")
@@ -604,7 +750,7 @@ class WebAppFinishTest(unittest.TestCase):
                             "AUTO_NORMALIZE",
                         )
 
-    def test_streaming_final_reuses_completed_window_refinement(self) -> None:
+    def test_streaming_final_processes_the_deferred_last_sentence(self) -> None:
         with (
             patch.object(web_app, "TransformersRefiner", _CountingRefiner),
             patch.object(web_app, "_stream_request", _stable_stream_request),
@@ -638,7 +784,9 @@ class WebAppFinishTest(unittest.TestCase):
                         final["clean_text"],
                         "第一段精修文本。第二段精修文本。",
                     )
-                    self.assertEqual(len(_CountingRefiner.calls), calls_before_finish)
+                    self.assertEqual(
+                        len(_CountingRefiner.calls), calls_before_finish + 1
+                    )
 
     def test_severe_content_loss_retries_with_strict_preservation(self) -> None:
         with (

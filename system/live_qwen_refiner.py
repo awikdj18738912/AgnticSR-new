@@ -323,8 +323,9 @@ def main(argv: list[str] | None = None) -> int:
         raw_text = normalize_cjk(raw_text).strip()
         if not raw_text:
             return
+        rule_cleaned_text = clean_transcript_deterministically(raw_text)
         prepared = prepare_entity_segment(
-            raw_text,
+            rule_cleaned_text,
             protector,
             matcher,
             allow_auto=True,

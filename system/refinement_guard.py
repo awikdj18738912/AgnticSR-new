@@ -8,7 +8,11 @@ from collections.abc import Iterable
 from difflib import SequenceMatcher
 from decimal import Decimal, InvalidOperation
 
-from .numeric_normalizer import _COUNT_UNITS, _FIXED_EXPRESSIONS
+from .numeric_normalizer import (
+    ContextualNumericNormalizer,
+    _COUNT_UNITS,
+    _FIXED_EXPRESSIONS,
+)
 
 
 _SENTENCE_ENDINGS = frozenset("。！？!?；;\n")
@@ -362,7 +366,13 @@ def _meaningful_edit_text(value: str) -> bool:
 
 
 def _retains_correction_tail(raw: str, refined: str) -> bool:
-    """Allow a compact rewrite when it keeps the corrected clause verbatim."""
+    """Allow a compact rewrite when it keeps the corrected clause's value.
+
+    The deterministic numeric pass can legitimately turn ``一箱梨`` into
+    ``1箱梨`` before or during refinement. Compare the normalized surfaces so
+    that formatting alone does not hide a retained correction tail. Numeric
+    values are still compared exactly: ``一箱梨`` will not match ``2箱梨``.
+    """
 
     for marker in ("不对", "不是", "而是", "应该是"):
         index = raw.rfind(marker)
@@ -376,7 +386,9 @@ def _retains_correction_tail(raw: str, refined: str) -> bool:
         tail = re.split(r"[,，、.。！？!?;；\n]", remainder, maxsplit=1)[0].strip(
             " ，,、"
         )
-        if tail and tail in refined:
+        normalized_tail = ContextualNumericNormalizer().normalize(tail).text
+        normalized_refined = ContextualNumericNormalizer().normalize(refined).text
+        if normalized_tail and normalized_tail in normalized_refined:
             return True
     return False
 
