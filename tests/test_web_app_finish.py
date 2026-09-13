@@ -183,6 +183,35 @@ def _stable_stream_request(
     raise AssertionError(f"unexpected endpoint: {endpoint}")
 
 
+class _GrowingStreamRequest:
+    """Return a cumulative transcript that grows with every chunk."""
+
+    TRANSCRIPTS = ("第一句原始文本。", "第一句原始文本。第二句原始文本。")
+
+    def __init__(self) -> None:
+        self.chunk_count = 0
+
+    def __call__(
+        self,
+        asr_url: str,
+        endpoint: str,
+        session_id: str | None = None,
+        data: bytes = b"",
+        params: dict[str, str] | None = None,
+    ) -> dict[str, object]:
+        if endpoint == "/stream/start":
+            return {"session_id": "growing-test-session"}
+        if endpoint == "/stream/chunk":
+            index = min(self.chunk_count, len(self.TRANSCRIPTS) - 1)
+            self.chunk_count += 1
+            return {"text": self.TRANSCRIPTS[index], "language": "Chinese"}
+        if endpoint == "/stream/finish":
+            return {"text": self.TRANSCRIPTS[-1], "language": "Chinese"}
+        if endpoint == "/stream/cancel":
+            return {"cancelled": True}
+        raise AssertionError(f"unexpected endpoint: {endpoint}")
+
+
 def _entity_stream_request(
     asr_url: str,
     endpoint: str,
@@ -292,6 +321,43 @@ def _numeric_stream_request(
         return {"session_id": "numeric-test-session"}
     if endpoint == "/stream/finish":
         return {"text": "你好，我有二万二千二百元。", "language": "Chinese"}
+    if endpoint == "/stream/cancel":
+        return {"cancelled": True}
+    raise AssertionError(f"unexpected endpoint: {endpoint}")
+
+
+_MULTI_STAGE_CORRECTION_TEXT = (
+    "你好，你好，我有一个苹果，不对，我有一个梨，不对，我有一个香蕉。"
+)
+
+
+class _ResolveCorrectionRefiner:
+    """A refiner that resolves the correction chain and applies ITN."""
+
+    def __init__(self, *args, **kwargs) -> None:
+        pass
+
+    def refine(
+        self,
+        text: str,
+        *,
+        entity_hints: tuple[str, ...] = (),
+        strict_placeholders: bool = False,
+    ) -> tuple[str, float]:
+        return "你好，我有1个香蕉。", 1.0
+
+
+def _multi_stage_correction_stream_request(
+    asr_url: str,
+    endpoint: str,
+    session_id: str | None = None,
+    data: bytes = b"",
+    params: dict[str, str] | None = None,
+) -> dict[str, object]:
+    if endpoint == "/stream/start":
+        return {"session_id": "multi-correction-test-session"}
+    if endpoint == "/stream/finish":
+        return {"text": _MULTI_STAGE_CORRECTION_TEXT, "language": "Chinese"}
     if endpoint == "/stream/cancel":
         return {"cancelled": True}
     raise AssertionError(f"unexpected endpoint: {endpoint}")
@@ -488,6 +554,87 @@ class WebAppFinishTest(unittest.TestCase):
             self.assertEqual(final["session_refiner_initial_call_count"], 1)
             self.assertEqual(final["session_refiner_retry_call_count"], 0)
 
+    @staticmethod
+    def _await_event(websocket, event: str) -> dict:
+        for _ in range(60):
+            message = websocket.receive_json()
+            if message.get("event") == event:
+                return message
+        raise AssertionError(f"event {event!r} was not received")
+
+    def test_finished_pass_is_published_even_when_asr_advanced(self) -> None:
+        """A completed pass must not be thrown away as stale.
+
+        Enqueueing a newer hypothesis used to bump the revision of the pass
+        that was already running, so on a fast stream every intermediate
+        result was dropped and the refined pane stayed empty until ``finish``.
+        """
+        with (
+            patch.object(web_app, "TransformersRefiner", _SlowRefiner),
+            patch.object(web_app, "STREAMING_REFINEMENT_MIN_INTERVAL_SECONDS", 0.0),
+            patch.object(web_app, "_stream_request", _GrowingStreamRequest()),
+        ):
+            app = web_app.create_app(
+                Path("/tmp/fake-refiner"),
+                "cpu",
+                "http://fake-asr",
+                "Chinese",
+                32,
+                None,
+            )
+            with TestClient(app) as client:
+                with client.websocket_connect(
+                    "/ws/stream?mode=streaming"
+                ) as websocket:
+                    self.assertEqual(websocket.receive_json()["event"], "ready")
+                    # The second hypothesis arrives while the first pass runs.
+                    websocket.send_bytes(b"pcm")
+                    websocket.send_bytes(b"pcm")
+
+                    first = self._await_event(websocket, "update")
+                    self.assertEqual(first["clean_text"], "第一句精修文本。")
+                    second = self._await_event(websocket, "update")
+                    self.assertEqual(
+                        second["clean_text"],
+                        "第一句精修文本。第二句精修文本。",
+                    )
+
+    def test_intermediate_refinement_interval_limits_repeated_passes(self) -> None:
+        """Hypotheses arriving inside the interval collapse into one pass."""
+        with (
+            patch.object(web_app, "TransformersRefiner", _CountingRefiner),
+            patch.object(web_app, "STREAMING_REFINEMENT_MIN_INTERVAL_SECONDS", 1.0),
+            patch.object(web_app, "_stream_request", _GrowingStreamRequest()),
+        ):
+            app = web_app.create_app(
+                Path("/tmp/fake-refiner"),
+                "cpu",
+                "http://fake-asr",
+                "Chinese",
+                32,
+                None,
+            )
+            with TestClient(app) as client:
+                with client.websocket_connect(
+                    "/ws/stream?mode=streaming"
+                ) as websocket:
+                    self.assertEqual(websocket.receive_json()["event"], "ready")
+                    websocket.send_bytes(b"pcm")
+                    websocket.send_bytes(b"pcm")
+                    websocket.send_bytes(b"pcm")
+
+                    self._await_event(websocket, "update")
+                    # The first pass runs immediately, the two later hypotheses
+                    # are absorbed while the interval is still pending.
+                    self.assertEqual(len(_CountingRefiner.calls), 1)
+
+                    websocket.send_json({"event": "finish"})
+                    final = self._await_event(websocket, "final")
+                    self.assertEqual(
+                        final["clean_text"],
+                        "第一句精修文本。第二句精修文本。",
+                    )
+
     def test_offline_mode_reuses_completed_window_refinement(self) -> None:
         with (
             patch.object(web_app, "TransformersRefiner", _CountingRefiner),
@@ -678,6 +825,40 @@ class WebAppFinishTest(unittest.TestCase):
                         ),
                         2,
                     )
+
+    def test_multi_stage_self_correction_is_accepted(self) -> None:
+        with (
+            patch.object(
+                web_app, "TransformersRefiner", _ResolveCorrectionRefiner
+            ),
+            patch.object(
+                web_app,
+                "_stream_request",
+                _multi_stage_correction_stream_request,
+            ),
+        ):
+            app = web_app.create_app(
+                Path("/tmp/fake-refiner"),
+                "cpu",
+                "http://fake-asr",
+                "Chinese",
+                32,
+                None,
+            )
+            with TestClient(app) as client:
+                with client.websocket_connect("/ws/stream?mode=offline") as websocket:
+                    self.assertEqual(websocket.receive_json()["event"], "ready")
+                    websocket.send_json({"event": "finish"})
+                    self.assertEqual(
+                        websocket.receive_json()["raw_text"],
+                        _MULTI_STAGE_CORRECTION_TEXT,
+                    )
+                    final = websocket.receive_json()
+
+        self.assertTrue(final["refiner_accepted"], final["refiner_reject_reasons"])
+        self.assertEqual(final["refiner_reject_reasons"], [])
+        self.assertEqual(final["refiner_masked_outputs"], ["你好，我有1个香蕉。"])
+        self.assertEqual(final["clean_text"], "你好，我有1个香蕉。")
 
     def test_semantic_loss_retries_and_keeps_source_when_needed(self) -> None:
         with (

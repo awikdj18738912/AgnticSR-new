@@ -8,7 +8,11 @@ from collections.abc import Iterable
 from difflib import SequenceMatcher
 from decimal import Decimal, InvalidOperation
 
-from .numeric_normalizer import _COUNT_UNITS, _FIXED_EXPRESSIONS
+from .numeric_normalizer import (
+    ContextualNumericNormalizer,
+    _COUNT_UNITS,
+    _FIXED_EXPRESSIONS,
+)
 
 
 _SENTENCE_ENDINGS = frozenset("。！？!?；;\n")
@@ -54,6 +58,9 @@ _FUNCTION_CHARS = frozenset(
     "的地得了着过是就才又也都还很太吗呢啊呀吧啦哦嗯呃和与及而给把被从向"
 )
 _ROLE_NUMBER_SUFFIXES = frozenset("伯叔爷奶哥姐妹弟")
+_CORRECTION_MARKERS = ("不对", "不是", "而是", "应该是")
+_CORRECTION_MARKER_RE = re.compile("|".join(_CORRECTION_MARKERS))
+_CORRECTION_SURFACE_NORMALIZER = ContextualNumericNormalizer()
 
 
 def split_for_refinement(
@@ -139,9 +146,8 @@ def reject_reasons(raw_text: str, refined_text: str) -> tuple[str, ...]:
             # A self-correction intentionally removes the false start.  If
             # the candidate retains the corrected tail, do not classify that
             # deliberate compression as whole-window content loss.
-            and not (
-                length_ratio >= 0.45
-                and _retains_correction_tail(raw, refined)
+            and not _is_intentional_correction_compression(
+                raw, refined, length_ratio
             )
         ):
             reasons.append("severe_content_loss")
@@ -291,6 +297,27 @@ def _allowed_replacement(
 ) -> bool:
     if _numeric_surface_only(raw, refined):
         return True
+    # A wider rewrite (for example a self-correction that also drops a
+    # number-bearing false start) disables ``_numeric_surface_only`` for the
+    # whole pair.  Legal ITN such as ``百分之三十七`` -> ``37%`` must still be
+    # accepted, but only when the numeric value itself is unchanged.
+    if _numeric_edit_is_equivalent(source, target):
+        return True
+    # Resolving a numeric self-correction replaces the superseded value with
+    # the corrected one (``...获得12345431元。不对，应该是100块。`` ->
+    # ``...获得100元。``).  Allow that only when the new value is the one the
+    # kept replacement clause states, so an invented value is still rejected.
+    tail_values = _correction_tail_values(raw, refined)
+    if tail_values:
+        # The sequence-alignment span usually stops right after the digits,
+        # leaving the unit (``元``/``块``/``%``) in an ``equal`` block, so
+        # test the span both with and without one trailing character.
+        for width in (0, 1):
+            candidate_values = _numeric_values(refined[target_start : target_end + width])
+            if candidate_values and all(
+                value in tail_values for value in candidate_values
+            ):
+                return True
     if _retains_correction_tail(raw, refined) and _deletion_touches_correction(
         raw, source_start, source_end
     ):
@@ -333,7 +360,7 @@ def _suspicious_insertion(text: str, start: int, end: int, target: str) -> bool:
 
 
 def _deletion_touches_correction(raw: str, start: int, end: int) -> bool:
-    for match in re.finditer(r"不对|不是|而是|应该是", raw):
+    for match in _CORRECTION_MARKER_RE.finditer(raw):
         marker_start = match.start()
         marker_end = match.end()
         if start <= marker_end and end >= marker_start:
@@ -361,24 +388,104 @@ def _meaningful_edit_text(value: str) -> bool:
     return bool(re.search(r"[\u3400-\u9fffA-Za-z0-9]", value))
 
 
-def _retains_correction_tail(raw: str, refined: str) -> bool:
-    """Allow a compact rewrite when it keeps the corrected clause verbatim."""
+def _correction_surface(text: str) -> str:
+    """Return ``text`` with explicit numbers in one canonical surface form.
 
-    for marker in ("不对", "不是", "而是", "应该是"):
-        index = raw.rfind(marker)
-        if index < 0:
-            continue
-        remainder = raw[index + len(marker):].lstrip(" ，,、")
-        # Only the clause immediately following the correction marker is the
-        # replacement target.  Do not require later independent sentences to
-        # survive verbatim, otherwise a valid correction is mistaken for
-        # whole-window loss merely because another clause was cleaned up.
-        tail = re.split(r"[,，、.。！？!?;；\n]", remainder, maxsplit=1)[0].strip(
-            " ，,、"
-        )
-        if tail and tail in refined:
-            return True
-    return False
+    The Refiner input has already passed through contextual ITN (``一个`` ->
+    ``1个``), so the reference text and the candidate can legitimately differ
+    only in number form.  Normalization is value preserving, which keeps a real
+    value change from being mistaken for a formatting difference.
+    """
+
+    return _CORRECTION_SURFACE_NORMALIZER.normalize(text).text
+
+
+def _matched_correction_tail(raw: str, refined: str) -> str | None:
+    """Return the replacement clause that ``refined`` still keeps, if any."""
+
+    raw_surface = _correction_surface(raw)
+    refined_surface = _correction_surface(refined)
+    refined_values = set(_numeric_values(refined_surface))
+    for marker in _CORRECTION_MARKERS:
+        # A chunk boundary can leave a dangling marker such as ``……不对，``
+        # at the very end of a window.  That occurrence has no replacement
+        # clause, so scan backwards for the most recent marker that does.
+        offsets = [m.start() for m in re.finditer(re.escape(marker), raw_surface)]
+        for index in reversed(offsets):
+            remainder = raw_surface[index + len(marker):].lstrip(" ，,、")
+            # Only the clause immediately following the correction marker is
+            # the replacement target.  Do not require later independent
+            # sentences to survive verbatim, otherwise a valid correction is
+            # mistaken for whole-window loss because another clause changed.
+            tail = re.split(r"[,，、.。！？!?;；\n]", remainder, maxsplit=1)[0].strip(
+                " ，,、"
+            )
+            if not tail:
+                continue
+            if tail in refined_surface:
+                return tail
+            # The refiner is told to resolve self-corrections, so it may
+            # restate the replacement clause instead of copying it.  A
+            # numeric correction such as ``不对，应该是一百五十块`` can
+            # legitimately surface as ``获得100元``: the ``应该是``
+            # connector is dropped and the currency unit is rewritten.
+            # Accept the clause when its numeric content is still present;
+            # a genuinely wrong value is not in ``refined_values`` and is
+            # still reported by the numeric guard below.
+            tail_values = _numeric_values(tail)
+            if tail_values and all(
+                value in refined_values for value in tail_values
+            ):
+                return tail
+    return None
+
+
+def _retains_correction_tail(raw: str, refined: str) -> bool:
+    """Allow a compact rewrite when it keeps the corrected clause."""
+
+    return _matched_correction_tail(raw, refined) is not None
+
+
+def _correction_tail_values(
+    raw: str, refined: str
+) -> tuple[tuple[Decimal, str], ...]:
+    """Return the numeric values stated by the kept replacement clause."""
+
+    tail = _matched_correction_tail(raw, refined)
+    return _numeric_values(tail) if tail else ()
+
+
+def _self_correction_count(text: str) -> int:
+    """Count clause-initial self-correction markers such as ``不对``.
+
+    A marker only counts when it starts a clause and is followed by the
+    replacement content.  This keeps ordinary negations (``我不是学生``) and the
+    ``是`` in ``不是 A 而是 B`` from looking like an extra correction.
+    """
+
+    break_chars = "，,、。！？!?；;\n"
+    count = 0
+    for match in _CORRECTION_MARKER_RE.finditer(text):
+        before = text[match.start() - 1 : match.start()]
+        after = text[match.end():].lstrip(" ，,、")
+        if after and (not before or before in break_chars):
+            count += 1
+    return count
+
+
+def _is_intentional_correction_compression(
+    raw: str, refined: str, length_ratio: float
+) -> bool:
+    """Exempt a deliberate self-correction collapse from content-loss checks.
+
+    A single correction must still leave enough of the window intact.  A
+    multi-stage chain legitimately collapses further, because every clause
+    before the last marker is a superseded false start.
+    """
+
+    if not _retains_correction_tail(raw, refined):
+        return False
+    return length_ratio >= 0.45 or _self_correction_count(raw) >= 2
 
 
 def _numeric_values(text: str) -> tuple[tuple[Decimal, str], ...]:
@@ -497,6 +604,15 @@ def _numeric_values(text: str) -> tuple[tuple[Decimal, str], ...]:
 
     values.sort(key=lambda item: item[0])
     return tuple((value, unit) for _, _, value, unit in values)
+
+
+def _numeric_edit_is_equivalent(source: str, target: str) -> bool:
+    """Return whether an edit only restates the same number differently."""
+
+    source_values = _numeric_values(source)
+    if not source_values or source_values != _numeric_values(target):
+        return False
+    return _numeric_skeleton(source) == _numeric_skeleton(target)
 
 
 def _numeric_surface_only(raw: str, refined: str) -> bool:

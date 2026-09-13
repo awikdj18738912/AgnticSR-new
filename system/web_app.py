@@ -43,6 +43,12 @@ WEB_DIR = Path(__file__).resolve().parent / "web"
 # Keep short early hypotheses responsive, then perform one complete refinement
 # when the client sends ``finish``.
 STREAMING_INTERMEDIATE_MAX_CHARS = 240
+# One refinement pass costs about half a second while a sentence window only
+# grows a few characters per ASR chunk, so retriggering it immediately mostly
+# regenerates the same active window.  Run at most one pass per interval.
+# Finished passes are published to the browser, so this interval is also the
+# refined-pane update cadence.
+STREAMING_REFINEMENT_MIN_INTERVAL_SECONDS = 2.5
 REFINER_LOCK_TIMEOUT_SECONDS = 30.0
 FINAL_REFINEMENT_TIMEOUT_SECONDS = 30.0
 # Long recordings are refined one bounded segment at a time.  Give the final
@@ -826,6 +832,7 @@ def create_app(
         streaming_refiner_task: asyncio.Task[None] | None = None
         streaming_finish_requested = False
         latest_refinement_revision = 0
+        last_refinement_started_at: float | None = None
         window_refinement = CumulativeWindowRefinement(session_refine_update)
 
         def finalize_streaming_windows(
@@ -945,13 +952,26 @@ def create_app(
 
         async def run_streaming_refiner() -> None:
             nonlocal pending_refinement, streaming_finish_requested
+            nonlocal latest_refinement_revision, last_refinement_started_at
             while pending_refinement is not None:
-                # Refine only a bounded tail of the cumulative ASR hypothesis.
-                # Committed results remain cached for finalization; stale UI
-                # updates are discarded whenever a newer hypothesis arrives.
+                # Refine only a bounded tail of the cumulative ASR hypothesis;
+                # committed results stay cached for finalization.
                 if streaming_finish_requested:
                     pending_refinement = None
                     return
+                if last_refinement_started_at is not None:
+                    remaining = (
+                        STREAMING_REFINEMENT_MIN_INTERVAL_SECONDS
+                        - (time.perf_counter() - last_refinement_started_at)
+                    )
+                    if remaining > 0:
+                        # Newer hypotheses keep replacing the pending request
+                        # while we wait, so the next pass always refines the
+                        # freshest cumulative transcript.
+                        await asyncio.sleep(remaining)
+                        if streaming_finish_requested or pending_refinement is None:
+                            pending_refinement = None
+                            return
                 (
                     tail_value,
                     language_value,
@@ -962,6 +982,11 @@ def create_app(
                     revision,
                 ) = pending_refinement
                 pending_refinement = None
+                # Claim the revision only now that this pass really starts.
+                # One pass runs at a time, so the publish guard below can no
+                # longer see a newer revision and discard a finished result.
+                latest_refinement_revision = revision
+                last_refinement_started_at = time.perf_counter()
                 try:
                     result = await asyncio.to_thread(
                         window_refinement.update,
@@ -973,9 +998,8 @@ def create_app(
                         matcher,
                         confidence_metadata=confidence_metadata_value,
                     )
-                    # A newer ASR hypothesis may have arrived while the
-                    # Refiner was running. Never publish an older cumulative
-                    # transcript: it can visually roll the whole pane back.
+                    # ``finish`` already published the complete transcript and
+                    # the browser ignores intermediate updates afterwards.
                     if streaming_finish_requested or revision != latest_refinement_revision:
                         continue
                     result["refinement_revision"] = revision
@@ -1002,9 +1026,10 @@ def create_app(
             full_raw_value: str,
             tail_start: int,
         ) -> None:
-            nonlocal pending_refinement, streaming_refiner_task, latest_refinement_revision
-            latest_refinement_revision += 1
-            revision = latest_refinement_revision
+            nonlocal pending_refinement, streaming_refiner_task
+            # Enqueueing must not invalidate the pass that is already
+            # running: the revision is claimed in run_streaming_refiner.
+            revision = latest_refinement_revision + 1
             pending_refinement = (
                 tail_value,
                 language_value,

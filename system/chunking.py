@@ -11,7 +11,12 @@ _ANY_PUNCTUATION = re.compile(
 )
 _SELF_CORRECTION = re.compile(r"(?:不对|不是|而是|应该是)")
 _SELF_CORRECTION_PREFIX = re.compile(r"^(?:不对|不是|而是|应该是)")
-_SOFT_CORRECTION_PUNCTUATION = re.compile(r"[,，;；:：、]\s*")
+# A corrected clause may end with either a soft clause punctuation or a
+# sentence terminator.  Only searching soft punctuation lets a break jump
+# past the real clause boundary to a far-away comma, producing an
+# oversized chunk that also pushes the correction value out of the
+# K-window refinement range.
+_CORRECTION_BOUNDARY_PUNCTUATION = re.compile(r"[,，;；:：、。！？!?]\s*")
 _SENTENCE_END_CHARACTERS = frozenset(".!?。！？")
 
 
@@ -105,7 +110,7 @@ class ChunkManager:
         return len(text) if flush else None
 
     def _self_correction_break(self, text: str) -> int | None:
-        """Return a soft boundary for a long self-correction clause."""
+        """Return the nearest clause boundary after a self-correction."""
 
         # Keep short examples such as ``苹果，不对，梨`` together so the
         # Refiner sees the full correction. For longer hypotheses, separate
@@ -120,7 +125,7 @@ class ChunkManager:
                 and text[search_start] in " \t,，;；:：、"
             ):
                 search_start += 1
-            punctuation = _SOFT_CORRECTION_PUNCTUATION.search(
+            punctuation = _CORRECTION_BOUNDARY_PUNCTUATION.search(
                 text,
                 search_start,
                 min(len(text), self.max_chars),

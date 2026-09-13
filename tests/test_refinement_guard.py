@@ -191,6 +191,92 @@ class NumericValidationAlignmentTest(unittest.TestCase):
                     "numeric_value_mismatch", reject_reasons(raw, refined)
                 )
 
+    def test_numeric_itn_inside_a_wider_edit_is_accepted(self) -> None:
+        # The pair is not numeric-surface-only because a self-correction
+        # removed a number-bearing false start.  The surviving numeric
+        # rewrite is still legal ITN and must not be flagged as semantic loss.
+        raw = "不对，我有一百二十三万五千四百三十一元。应该是二百万零五十元。"
+        self.assertEqual(reject_reasons(raw, "应该是2000050元。"), ())
+
+
+class MultiStageSelfCorrectionTest(unittest.TestCase):
+    """A multi-stage correction chain may collapse to its final clause even
+    when the refiner only sees the ITN-normalized surface (``一个`` -> ``1个``)."""
+
+    RAW = "你好，你好，我有一个苹果，不对，我有一个梨，不对，我有一个香蕉。"
+    RESOLVED = "你好，我有1个香蕉。"
+
+    def test_itn_normalized_correction_tail_is_accepted(self) -> None:
+        self.assertEqual(reject_reasons(self.RAW, self.RESOLVED), ())
+
+    def test_multi_stage_chain_keeps_working_with_sentence_punctuation(self) -> None:
+        raw = "你好，你好，我有一个苹果。不对，我有一个梨。不对，我有一个香蕉。"
+        self.assertEqual(reject_reasons(raw, "你好，我有1个香蕉。"), ())
+
+    def test_single_stage_correction_still_needs_a_reasonable_ratio(self) -> None:
+        # Only one correction marker: a deep collapse that keeps the tail is
+        # still reported as content loss instead of being silently accepted.
+        raw = "今天早上我在家里吃了一个苹果，不对，我吃了一个梨。"
+        reasons = reject_reasons(raw, "我吃了1个梨。")
+        self.assertIn("severe_content_loss", reasons)
+
+    def test_changed_number_in_correction_tail_is_still_rejected(self) -> None:
+        # Numeric normalization must stay value preserving: a real value
+        # change inside the retained tail is not a formatting difference.
+        reasons = reject_reasons("不对，我有五个梨。", "我有3个梨。")
+        self.assertIn("numeric_value_mismatch", reasons)
+
+    def test_dangling_correction_marker_does_not_hide_earlier_correction(self) -> None:
+        # A chunk boundary may leave ``不对，`` dangling at the end of a
+        # window.  That occurrence has no replacement clause, so the guard
+        # must fall back to the earlier complete self-correction instead of
+        # reporting the whole window as content loss.
+        raw = (
+            "你好，我有一个苹果。不对，我有一个梨。"
+            "今天是二零一五年十二月五日。"
+            "我有百分之三十七的概率会获得一百二十三万五千四百三十一元。不对，"
+        )
+        refined = (
+            "你好，我有1个梨。今天是2015年12月5日。"
+            "我有37%的概率会获得1235431元。"
+        )
+        self.assertEqual(reject_reasons(raw, refined), ())
+
+
+class NumericSelfCorrectionTest(unittest.TestCase):
+    """A numeric self-correction chain may collapse to the final value."""
+
+    RAW = (
+        "我有百分之三十七的概率在二零一五年十二月五日这天获得"
+        "一千二百三十四万五千四百三十一元。不对，应该是一百五十块。不对，应该是一百块。"
+    )
+
+    def test_numeric_correction_chain_collapses_to_final_value(self) -> None:
+        # The Refiner resolved the amount to ``100元``.  ``100块`` and
+        # ``100元`` are the same currency mention, and the superseded
+        # values are exactly what a self-correction discards.
+        self.assertEqual(
+            reject_reasons(
+                self.RAW,
+                "我有37%的概率在2015年12月5日这天获得100元。",
+            ),
+            (),
+        )
+
+    def test_invented_value_inside_a_correction_is_rejected(self) -> None:
+        reasons = reject_reasons(
+            "获得一千二百三十四万五千四百三十一元。不对，应该是一百块。",
+            "获得555元。应该是100块。",
+        )
+        self.assertIn("semantic_content_loss", reasons)
+
+    def test_unit_change_inside_a_correction_is_rejected(self) -> None:
+        reasons = reject_reasons(
+            "获得一千二百三十四万五千四百三十一元。不对，应该是一百块。",
+            "获得100个。应该是100块。",
+        )
+        self.assertIn("semantic_content_loss", reasons)
+
 
 if __name__ == "__main__":
     unittest.main()

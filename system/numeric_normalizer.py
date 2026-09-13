@@ -5,6 +5,15 @@ values in Chinese numerals. This module handles explicit numeric contexts
 (money, percentages, full dates/times, measurements, and classifier counts)
 plus unambiguous positional forms such as ``二十三``. Approximate adjacent
 digit runs and fixed expressions remain untouched.
+
+Chinese has no word boundaries, so every rule starts from a *numeral boundary*
+(see ``_NUMERAL_START_GUARD``): a match may never begin inside a longer numeral
+expression (``六十多万条`` must not be read as the number ``万条``) and never
+directly after a decimal point (``一点七亿`` must not be read as ``七亿``).
+Large units keep their unit character instead of expanding to bare digits, so
+``十亿`` becomes ``10亿`` and ``一点七亿`` becomes ``1.7亿``.  Lexical usages
+that only look numeric (``万一``, ``一度``, ``数千``, ``江河百川``) stay in the
+spoken form.
 """
 
 from __future__ import annotations
@@ -33,6 +42,16 @@ _LARGE_UNITS = {"万": 10_000, "亿": 100_000_000}
 _CN_INTEGER = "零〇一二两三四五六七八九十百千万亿"
 _CN_DIGIT = "零〇一二两三四五六七八九"
 _CN_NUMBER_PATTERN = rf"[{_CN_INTEGER}]+(?:点[{_CN_DIGIT}]+)?"
+
+# Chinese has no word boundaries, so a numeral rule that is allowed to start in
+# the middle of a larger numeral expression silently corrupts the sentence
+# (``六十多万条`` -> ``万条``, ``四点五万条`` -> ``五万条``, ``一点七亿`` ->
+# ``七亿``).  Every rule is therefore anchored: a match may not begin right
+# after another numeral character, a decimal point, an approximation prefix
+# (``数个``/``几百``/``好几年``/``十几``) or an ASCII digit.  The digit guard is
+# what makes normalization idempotent: without it the second pass reads the
+# ``亿`` of the ``10亿`` produced by the first pass and emits ``10100000000``.
+_NUMERAL_START_GUARD = rf"(?<![{_CN_INTEGER}点几多来余数0-9０-９])"
 
 # Keep an explicit deny-list in addition to contextual matching.  It makes the
 # safety policy obvious and protects an idiom even if it happens to be next to
@@ -164,25 +183,54 @@ _COUNT_UNIT_PATTERN = "|".join(
     sorted(map(re.escape, _COUNT_UNITS), key=len, reverse=True)
 )
 _COUNT_NUMBER_RE = re.compile(
+    rf"{_NUMERAL_START_GUARD}"
     rf"(?P<number>{_CN_NUMBER_PATTERN})(?P<unit>{_COUNT_UNIT_PATTERN})"
 )
 _RANGE_RE = re.compile(
+    rf"{_NUMERAL_START_GUARD}"
     rf"(?P<left>{_CN_NUMBER_PATTERN})(?P<separator>到|至|[-~～])"
     rf"(?P<right>{_CN_NUMBER_PATTERN})(?P<unit>{_UNIT_PATTERN})"
 )
 _UNIT_NUMBER_RE = re.compile(
+    rf"{_NUMERAL_START_GUARD}"
     rf"(?P<number>{_CN_NUMBER_PATTERN})(?P<unit>{_UNIT_PATTERN})"
 )
+# Large units (``万``/``亿``) are kept as units instead of being expanded to
+# bare digits: ``十亿吨`` -> ``10亿吨``, ``一点七亿`` -> ``1.7亿``,
+# ``四点五万条`` -> ``4.5万条``.  Approximation suffixes are preserved both
+# before the unit (``六十多万条`` -> ``60多万条``) and after it
+# (``三万多个`` -> ``3万多个``).
+_LARGE_UNIT_NUMBER_RE = re.compile(
+    rf"{_NUMERAL_START_GUARD}"
+    rf"(?P<number>[{_CN_INTEGER}]+(?:点[{_CN_DIGIT}]+)?)"
+    rf"(?P<prefix>多)?(?P<unit>[万亿])(?P<suffix>多)?"
+    rf"(?![{_CN_INTEGER}])"
+)
+
 # A positional Chinese number is still a number without a trailing unit:
-# ``二十三`` and ``一百二十三万``.  Bare adjacent digit runs such as ``二三``
+# ``二十三`` and ``一百二十三``.  Bare adjacent digit runs such as ``二三``
 # are deliberately excluded because they commonly express an approximation,
-# list, or lexical phrase rather than one numeric value.
+# list, or lexical phrase rather than one numeric value.  A single unit
+# character (``百``/``千``/``万``) is never a value on its own in speech
+# (``江河百川``/``数千种``/``万不得已``), so such tokens stay untouched.
 _POSITIONAL_NUMBER_RE = re.compile(
-    rf"(?<![{_CN_INTEGER}])"
+    rf"{_NUMERAL_START_GUARD}"
     rf"(?P<number>[{_CN_INTEGER}]*[十百千万亿][{_CN_INTEGER}]*)"
     rf"(?![{_CN_INTEGER}])"
 )
+_POSITIONAL_MIN_CHARS = 2
+# Tokens that read as numerals but are lexical in speech (``万一``/``千万``
+# as adverbs, ``亿万``/``万万`` as hyperbole).
+_POSITIONAL_EXPRESSIONS = frozenset({"万一", "千万", "亿万", "万万", "千千万万", "万万千千"})
+# Spoken numerals that look like a measurement but are lexical adverbs.  Only
+# the exact single-character pairs are excluded, so ``三十一度``/``一块钱``
+# still convert through their longer form.
+_LEXICAL_UNIT_PAIRS = frozenset({("一", "度"), ("一", "块")})
 _AMBIGUOUS_NUMBER_SUFFIXES = frozenset("几多来余")
+# A large unit on its own carries no value in spoken Chinese.
+_BARE_LARGE_UNITS = frozenset({"万", "亿"})
+# Positional characters that can never form a value twice in a row.
+_POSITIONAL_ONLY_CHARS = frozenset("十百千万亿")
 
 
 @dataclass(frozen=True, slots=True)
@@ -276,8 +324,35 @@ class ContextualNumericNormalizer:
                     "measurement_range",
                 )
 
+        # Keep the unit character for large values instead of expanding to
+        # bare digits (``十亿`` -> ``10亿``).  Registered first so the
+        # measurement rule below cannot re-read the same span.
+        for match in _LARGE_UNIT_NUMBER_RE.finditer(text):
+            token = match.group("number")
+            if len(token) >= 2 and all(char in _POSITIONAL_ONLY_CHARS for char in token):
+                # ``千千万万``/``万万千千`` are hyperbole, not a value.
+                continue
+            if _ambiguous_number_token(token, text, match.start("unit")):
+                continue
+            value = chinese_number_to_decimal(token)
+            if value is None:
+                continue
+            prefix = match.group("prefix") or ""
+            suffix = match.group("suffix") or ""
+            add(
+                *match.span(),
+                f"{_format_decimal(value)}{prefix}{match.group('unit')}{suffix}",
+                "number",
+            )
+
         for match in _UNIT_NUMBER_RE.finditer(text):
-            value = chinese_number_to_decimal(match.group("number"))
+            token = match.group("number")
+            if (token, match.group("unit")) in _LEXICAL_UNIT_PAIRS:
+                continue
+            # ``二三十岁``/``十几米`` are approximations, not 30/10.
+            if _ambiguous_number_token(token, text, match.end("number")):
+                continue
+            value = chinese_number_to_decimal(token)
             if value is not None:
                 add(
                     *match.span(),
@@ -302,11 +377,16 @@ class ContextualNumericNormalizer:
                 )
 
         # Positional numbers do not always carry an explicit unit.  Convert
-        # ``二十三`` and ``一百二十三万`` while leaving approximate forms such
-        # as ``二三十``/``十几`` untouched.  Fixed expressions are excluded by
-        # ``add`` through their protected spans.
+        # ``二十三`` and ``一百二十三`` while leaving approximate forms such as
+        # ``二三十``/``十几``, single unit characters (``百``/``千``/``万``) and
+        # lexical pairs (``万一``/``千万``) untouched.  Fixed expressions are
+        # excluded by ``add`` through their protected spans.
         for match in _POSITIONAL_NUMBER_RE.finditer(text):
             token = match.group("number")
+            if len(token) < _POSITIONAL_MIN_CHARS:
+                continue
+            if token in _POSITIONAL_EXPRESSIONS:
+                continue
             if _ambiguous_number_token(token, text, match.end()):
                 continue
             value = chinese_number_to_decimal(token)
@@ -395,14 +475,19 @@ def _fixed_expression_spans(text: str) -> tuple[tuple[int, int], ...]:
 
 
 def _ambiguous_number_token(token: str, text: str, end: int) -> bool:
-    """Return whether a numeral is an approximation/list, not one value.
+    """Return whether a token is not a standalone numeric value.
 
     ``二三`` and ``二三十`` are commonly spoken as ``two or three`` and
-    ``twenty or thirty``.  Treating them as the integers 23 and 30 would
-    change the meaning.  A single digit before a positional unit (``二十三``)
-    remains a normal number and is converted.
+    ``twenty or thirty``; treating them as the integers 23 and 30 would change
+    the meaning.  A bare ``万``/``亿`` is a unit without a value in front of it
+    (``亿元``/``亿万吨``), so it is not converted either.  A single digit
+    before a positional unit (``二十三``) remains a normal number.
     """
 
+    if token in _BARE_LARGE_UNITS:
+        return True
+    if token in _POSITIONAL_EXPRESSIONS:
+        return True
     if len(token) >= 2 and all(char in _CN_DIGIT for char in token):
         return True
     first_unit = next(
