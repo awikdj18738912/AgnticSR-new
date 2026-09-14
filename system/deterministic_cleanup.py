@@ -11,6 +11,36 @@ _TERMINAL_BOUNDARY_RE = re.compile(r"([。！？!?\uff1b;\n]+\s*)$")
 _COMMA_RE = re.compile(r"([，,])")
 _VISIBLE_RE = re.compile(r"[\w\u3400-\u9fff]", re.UNICODE)
 _PRONOUN_STUTTER_RE = re.compile(r"([我你您他她它这那])\1+")
+_REPEATED_CHARACTER_STUTTER_RE = re.compile(
+    r"([\u3400-\u9fff])\1(?=[\u3400-\u9fff])"
+)
+_STANDALONE_FILLER_RE = re.compile(
+    r"(?P<left>^|[，,、；;])\s*"
+    r"(?P<filler>呃+|额+)\s*"
+    r"(?P<right>[，,、；;。！？!?]|$)"
+)
+
+# These are common lexical reduplications, not ASR stutters.  The repeated
+# character rule below is intentionally disabled for this small allowlist so
+# phrases such as ``看看这里`` and ``人人平等`` remain unchanged.
+_LEXICAL_REDUPLICATIONS = frozenset(
+    {
+        "人人", "天天", "年年", "月月", "日日", "家家", "处处", "时时",
+        "事事", "步步", "层层", "面面", "头头", "句句", "字字", "件件",
+        "次次", "样样", "种种", "常常", "往往", "渐渐", "慢慢", "悄悄",
+        "默默", "深深", "紧紧", "牢牢", "早早", "高高", "好好", "看看",
+        "听听", "说说", "想想", "试试", "问问", "走走", "聊聊", "等等",
+        "刚刚", "仅仅", "偏偏", "重重", "整整", "满满", "稳稳", "远远",
+        "多多", "大大", "轻轻", "缓缓", "纷纷", "偷偷", "静静", "悄悄",
+        "滚滚", "滔滔", "熊熊", "翩翩", "彬彬", "济济", "赫赫", "茫茫",
+        "哈哈", "呵呵", "嘿嘿", "嘻嘻", "爸爸", "妈妈", "哥哥", "姐姐",
+        "弟弟", "妹妹", "爷爷", "奶奶", "叔叔", "伯伯", "姑姑", "舅舅",
+        "宝宝", "娃娃", "星星", "点点", "团团", "圆圆", "毛毛", "晶晶",
+        "明明", "菲菲", "婷婷", "珊珊", "萌萌", "乐乐", "念念", "津津",
+        "喃喃", "依依", "楚楚", "冉冉", "芸芸", "寥寥", "区区", "惴惴",
+        "惶惶", "惺惺", "铮铮", "凿凿", "孜孜", "佼佼",
+    }
+)
 
 
 def clean_transcript_deterministically(text: str) -> str:
@@ -18,9 +48,37 @@ def clean_transcript_deterministically(text: str) -> str:
 
     return collapse_repeated_short_utterances(
         collapse_repeated_comma_items(
-            collapse_repeated_pronoun_stutters(text)
+            collapse_repeated_character_stutters(
+                collapse_repeated_pronoun_stutters(
+                    collapse_standalone_fillers(text)
+                )
+            )
         )
     )
+
+
+def collapse_standalone_fillers(text: str) -> str:
+    """Remove unambiguous standalone ``呃``/``额`` fillers.
+
+    Only punctuation-delimited fillers are touched.  This deliberately keeps
+    attached words such as ``呃逆`` and meaningful phrases such as ``嗯哼``.
+    When a filler sits between two commas, one comma is retained; before a
+    sentence terminator the preceding comma is removed to avoid ``，。``.
+    """
+
+    if not text:
+        return text
+
+    def replace(match: re.Match[str]) -> str:
+        left = match.group("left")
+        right = match.group("right")
+        if right in "，,、；;":
+            return "" if left == "" else left
+        if right in "。！？!?":
+            return right
+        return ""
+
+    return _STANDALONE_FILLER_RE.sub(replace, text)
 
 
 def collapse_repeated_pronoun_stutters(text: str) -> str:
@@ -31,6 +89,25 @@ def collapse_repeated_pronoun_stutters(text: str) -> str:
     """
 
     return _PRONOUN_STUTTER_RE.sub(lambda match: match.group(1), text)
+
+
+def collapse_repeated_character_stutters(text: str) -> str:
+    """Collapse repeated single-character ASR stutters inside a word.
+
+    A repeated CJK character followed by more CJK text is treated as a
+    stutter unless the two-character sequence is a common lexical
+    reduplication.  Requiring a following CJK character avoids changing a
+    standalone lexical pair at the end of a phrase.
+    """
+
+    if not text:
+        return text
+
+    def replace(match: re.Match[str]) -> str:
+        pair = match.group(0)
+        return pair if pair in _LEXICAL_REDUPLICATIONS else match.group(1)
+
+    return _REPEATED_CHARACTER_STUTTER_RE.sub(replace, text)
 
 
 def collapse_repeated_comma_items(

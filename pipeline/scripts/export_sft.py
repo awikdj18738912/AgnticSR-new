@@ -7,17 +7,20 @@ import sys
 from collections import defaultdict
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(PROJECT_ROOT))
+sys.path.insert(0, str(PROJECT_ROOT / "pipeline"))
 
 from src.utils.io_utils import read_jsonl
+from system.refinement_protocol import REFINER_SYSTEM_PROMPT
 
+# Keep the SFT protocol aligned with the deployed Refiner contract.  The
+# numeric normalizer remains a deterministic runtime stage; the model is
+# trained to preserve numeric values and remove oral disfluencies instead of
+# learning a second, potentially inconsistent number conversion policy.
 DEFAULT_VALIDATION_RATIO = 0.15
 
-SYSTEM_PROMPT = (
-    "你是 ASR 文本纠错助手。保留原意，最小修改：去口癖/重复，修错字，补必要标点，"
-    "规范数字、日期、术语和代码符号，处理自我修正。不要总结、扩写或解释。"
-    "重要易错实体在末尾追加 <KEY>[词1、词2]；没有则不加。"
-)
+SYSTEM_PROMPT = REFINER_SYSTEM_PROMPT
 
 
 def convert_one(item: dict) -> dict | None:

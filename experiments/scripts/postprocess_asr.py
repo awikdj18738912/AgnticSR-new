@@ -37,6 +37,7 @@ from system.entity_pipeline import (
     prepare_entity_segment,
 )
 from system.protection import EntityProtector
+from system.refinement_protocol import STRICT_PLACEHOLDER_PROMPT
 from system.refinement_gate import (
     RefinementGate,
     RefinementGateDecision,
@@ -50,11 +51,6 @@ SYSTEM_PROMPT = (
     "重要易错实体在末尾追加 <KEY>[词1、词2]；没有则不加。"
     "输入中形如 __ENTITY_000__ 的内容是不可编辑的受保护标记；"
     "每个标记必须原样保留一次，不得删除、改写、重复或调整顺序。"
-)
-STRICT_PLACEHOLDER_PROMPT = (
-    "最高优先级：完整保留输入中的每个句子和信息，不得总结、缩写、"
-    "合并或删除内容。先逐字复制所有 __ENTITY_NNN__ 标记到对应位置，"
-    "再仅修正其他文字的错字和标点。任何标记都不能省略或改变。"
 )
 Conversation: TypeAlias = list[dict[str, str]]
 

@@ -8,15 +8,8 @@ from dataclasses import dataclass
 from typing import Protocol, Sequence
 
 from .chunking import Chunk
+from .refinement_protocol import REFINER_SYSTEM_PROMPT as SYSTEM_PROMPT
 
-SYSTEM_PROMPT = (
-    "你是 ASR 文本纠错助手。保留原意，最小修改：去口癖/重复，修错字，补必要标点，"
-    "处理自我修正。不要总结、扩写或解释。数字、日期、术语和代码符号已由系统规则"
-    "处理，不得自行转换数字，成语中的汉字数字（如三番五次）必须保持原样。"
-    "重要易错实体在末尾追加 <KEY>[词1、词2]；没有则不加。"
-    "输入中形如 __ENTITY_000__ 的受保护标记必须在输出中原样保留一次，"
-    "不得删除、改写、重复或调整顺序。"
-)
 
 class TextRefiner(Protocol):
     """Backend contract used by offline and streaming inference."""

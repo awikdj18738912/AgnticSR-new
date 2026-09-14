@@ -48,7 +48,7 @@ STREAMING_INTERMEDIATE_MAX_CHARS = 240
 # regenerates the same active window.  Run at most one pass per interval.
 # Finished passes are published to the browser, so this interval is also the
 # refined-pane update cadence.
-STREAMING_REFINEMENT_MIN_INTERVAL_SECONDS = 2.5
+STREAMING_REFINEMENT_MIN_INTERVAL_SECONDS = 1.0
 REFINER_LOCK_TIMEOUT_SECONDS = 30.0
 FINAL_REFINEMENT_TIMEOUT_SECONDS = 30.0
 # Long recordings are refined one bounded segment at a time.  Give the final

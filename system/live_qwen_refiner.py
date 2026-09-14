@@ -37,6 +37,7 @@ from .entity_pipeline import (
 from .protection import EntityProtector
 from .refinement_gate import RefinementGate, RefinementGateMode
 from .numeric_normalizer import ContextualNumericNormalizer
+from .refinement_protocol import STRICT_PLACEHOLDER_PROMPT
 from .session_memory import SessionEntityMemory
 
 SYSTEM_PROMPT = (
@@ -50,13 +51,6 @@ SYSTEM_PROMPT = (
     "输入中形如 __ENTITY_000__ 的内容是不可编辑的受保护标记；"
     "每个标记必须在输出中原样保留一次，不得删除、改写、重复或调整顺序。"
 )
-
-STRICT_PLACEHOLDER_PROMPT = (
-    "最高优先级：完整保留输入中的每个句子和信息，不得总结、缩写、"
-    "合并或删除内容。先逐字复制所有 __ENTITY_NNN__ 标记到对应位置，"
-    "再仅修正其他文字的错字和标点。任何标记都不能省略或改变。"
-)
-
 
 class TransformersRefiner:
     """Local Transformers backend matching the offline Refiner prompt."""

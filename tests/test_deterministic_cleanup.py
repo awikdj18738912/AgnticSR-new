@@ -3,9 +3,11 @@ from __future__ import annotations
 import unittest
 
 from system.deterministic_cleanup import (
+    collapse_repeated_character_stutters,
     clean_transcript_deterministically,
     collapse_repeated_comma_items,
     collapse_repeated_short_utterances,
+    collapse_standalone_fillers,
 )
 
 
@@ -61,6 +63,25 @@ class DeterministicCleanupTest(unittest.TestCase):
             clean_transcript_deterministically("你你竟结成了元婴，我我不知道。"),
             "你竟结成了元婴，我不知道。",
         )
+
+    def test_repeated_content_character_stutters_are_collapsed(self) -> None:
+        self.assertEqual(
+            clean_transcript_deterministically(
+                "儒儒家的，跟孟孟子争争论的人呢。"
+            ),
+            "儒家的，跟孟子争论的人呢。",
+        )
+
+    def test_lexical_reduplication_is_preserved(self) -> None:
+        source = "人人平等，天天向上，看看这里，爸爸妈妈，哈哈笑。"
+        self.assertEqual(collapse_repeated_character_stutters(source), source)
+
+    def test_standalone_fillers_are_removed_without_touching_words(self) -> None:
+        self.assertEqual(
+            collapse_standalone_fillers("饭，呃，要上床，呃，这是本性的"),
+            "饭，要上床，这是本性的",
+        )
+        self.assertEqual(collapse_standalone_fillers("嗯哼，呃逆。"), "嗯哼，呃逆。")
 
     def test_normal_chinese_reduplication_is_preserved(self) -> None:
         source = "人人平等，天天向上，好好学习，让我看看。"
