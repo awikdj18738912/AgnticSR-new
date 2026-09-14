@@ -44,6 +44,7 @@
     section h2 { margin: 0 0 10px; font-size: 14px; font-weight: 680; color: #53615f; }
     .text { min-height: 112px; margin: 0; white-space: pre-wrap; line-height: 1.7; font-size: 16px; }
     .refined .text { font-weight: 600; }
+    .pending-refinement { color: #71807c; font-weight: 400; text-decoration: underline dotted #9ba8a5; text-underline-offset: 4px; }
     .error { color: #a62927; }
     .refinement-history { margin-top: 30px; padding-top: 24px; border-top: 1px solid #c9d1cf; }
     .history-header { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; margin-bottom: 12px; }
@@ -595,6 +596,30 @@
       socket = null;
     }
 
+    function renderRefinedText(data) {
+      const hasStreamingDisplay = (
+        (data.event === 'transcript' || data.event === 'update')
+        && typeof data.display_refined_text === 'string'
+        && typeof data.pending_raw_text === 'string'
+      );
+      if (!hasStreamingDisplay) {
+        if (data.clean_text !== undefined) clean.textContent = data.clean_text;
+        return;
+      }
+      clean.replaceChildren();
+      if (data.display_refined_text) {
+        clean.append(document.createTextNode(data.display_refined_text));
+      }
+      if (data.pending_raw_text) {
+        const pending = document.createElement('span');
+        pending.className = 'pending-refinement';
+        pending.title = '等待后台精修';
+        pending.setAttribute('aria-label', '待精修文本');
+        pending.textContent = data.pending_raw_text;
+        clean.append(pending);
+      }
+    }
+
     function join(a, b) {
       const output = new Float32Array(a.length + b.length);
       output.set(a); output.set(b, a.length);
@@ -674,10 +699,8 @@
             }
           }
           if (data.raw_text !== undefined && data.event !== 'update') raw.textContent = data.raw_text;
-          if (data.clean_text !== undefined) {
-            clean.textContent = data.clean_text;
-            if (data.event === 'update' || data.event === 'final') latestRefinedText = data.clean_text;
-          }
+          renderRefinedText(data);
+          if (data.clean_text !== undefined && (data.event === 'update' || data.event === 'final')) latestRefinedText = data.clean_text;
           if (data.event === 'transcript') {
             const deferred = data.refiner_deferred === true;
             refinerExecuted.textContent = deferred ? '等待最终精修' : '后台精修排队中';

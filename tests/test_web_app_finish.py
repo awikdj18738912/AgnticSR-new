@@ -591,13 +591,33 @@ class WebAppFinishTest(unittest.TestCase):
                     websocket.send_bytes(b"pcm")
                     websocket.send_bytes(b"pcm")
 
+                    first_transcript = self._await_event(websocket, "transcript")
+                    self.assertEqual(first_transcript["display_refined_text"], "")
+                    self.assertEqual(
+                        first_transcript["pending_raw_text"], "第一句原始文本。"
+                    )
+                    second_transcript = self._await_event(websocket, "transcript")
+                    self.assertEqual(
+                        second_transcript["pending_raw_text"],
+                        "第一句原始文本。第二句原始文本。",
+                    )
                     first = self._await_event(websocket, "update")
                     self.assertEqual(first["clean_text"], "第一句精修文本。")
+                    self.assertEqual(
+                        first["display_refined_text"], "第一句精修文本。"
+                    )
+                    self.assertEqual(first["pending_raw_text"], "第二句原始文本。")
+                    self.assertEqual(
+                        first["display_text"],
+                        "第一句精修文本。第二句原始文本。",
+                    )
                     second = self._await_event(websocket, "update")
                     self.assertEqual(
                         second["clean_text"],
                         "第一句精修文本。第二句精修文本。",
                     )
+                    self.assertEqual(second["pending_raw_text"], "")
+                    self.assertFalse(second["has_pending_refinement"])
 
     def test_intermediate_refinement_interval_limits_repeated_passes(self) -> None:
         """Hypotheses arriving inside the interval collapse into one pass."""

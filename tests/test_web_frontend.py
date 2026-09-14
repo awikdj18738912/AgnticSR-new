@@ -16,6 +16,14 @@ class WebFrontendMetricsTests(unittest.TestCase):
         self.assertIn("stats.gate_skipped_segment_count", html)
         self.assertIn("updateSessionMetrics(data);", html)
 
+    def test_streaming_refinement_renders_pending_tail_separately(self) -> None:
+        html = INDEX_HTML.read_text(encoding="utf-8")
+
+        self.assertIn("function renderRefinedText(data)", html)
+        self.assertIn("data.display_refined_text", html)
+        self.assertIn("data.pending_raw_text", html)
+        self.assertIn("pending.className = 'pending-refinement'", html)
+
 
 if __name__ == "__main__":
     unittest.main()

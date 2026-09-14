@@ -33,7 +33,10 @@ from .protection import EntityProtector
 from .refinement_gate import RefinementGate, RefinementGateMode
 from .refinement_guard import join_refined_segments, split_for_refinement
 from .numeric_normalizer import ContextualNumericNormalizer
-from .window_refinement import CumulativeWindowRefinement
+from .window_refinement import (
+    CumulativeWindowRefinement,
+    StreamingRefinementDisplay,
+)
 from .session_memory import SessionEntityMemory
 
 WEB_DIR = Path(__file__).resolve().parent / "web"
@@ -834,6 +837,28 @@ def create_app(
         latest_refinement_revision = 0
         last_refinement_started_at: float | None = None
         window_refinement = CumulativeWindowRefinement(session_refine_update)
+        refinement_display = StreamingRefinementDisplay()
+
+        def transcript_event(
+            raw_text: str,
+            detected_language: str | None,
+            asr_confidence: float | None,
+            confidence_metadata: dict[str, object],
+            *,
+            deferred: bool,
+        ) -> dict[str, object]:
+            """Publish raw ASR immediately while retaining valid refinements."""
+
+            payload: dict[str, object] = {
+                "event": "transcript",
+                "raw_text": raw_text,
+                "asr_language": detected_language,
+                "asr_confidence": asr_confidence,
+                "asr_confidence_metadata": confidence_metadata,
+                "refiner_deferred": deferred,
+            }
+            payload.update(refinement_display.compose(raw_text))
+            return payload
 
         def finalize_streaming_windows(
             raw_text: str,
@@ -1005,6 +1030,13 @@ def create_app(
                     result["refinement_revision"] = revision
                     result["raw_text"] = full_raw_value
                     result["event"] = "update"
+                    refinement_display.accept(result, revision)
+                    # ASR may have advanced while this model call was running.
+                    # Publish the real result for history/metrics, but render it
+                    # together with the newest source-owned pending tail.
+                    result.update(
+                        refinement_display.compose(last_raw_text or full_raw_value)
+                    )
                     attach_refiner_session_stats(result)
                     if not await send_json(result):
                         return
@@ -1140,6 +1172,7 @@ def create_app(
                         if key in payload
                     }
                     final_raw = str(payload.get("text", "")).strip()
+                    last_raw_text = final_raw
                     detected_language = payload.get("language")
                     asr_confidence = _optional_confidence(payload.get("confidence"))
                     confidence_metadata = _confidence_metadata(payload)
@@ -1148,18 +1181,17 @@ def create_app(
                         # potentially slow neural pass. This keeps the raw
                         # transcript available even while refinement is busy.
                         if not await send_json(
-                            {
-                                "event": "transcript",
-                                "raw_text": final_raw,
-                                "asr_language": (
+                            transcript_event(
+                                final_raw,
+                                (
                                     detected_language
                                     if isinstance(detected_language, str)
                                     else None
                                 ),
-                                "asr_confidence": asr_confidence,
-                                "asr_confidence_metadata": confidence_metadata,
-                                "refiner_deferred": True,
-                            }
+                                asr_confidence,
+                                confidence_metadata,
+                                deferred=True,
+                            )
                         ):
                             finished = True
                             break
@@ -1322,14 +1354,13 @@ def create_app(
                             else None
                         )
                         if not await send_json(
-                            {
-                                "event": "transcript",
-                                "raw_text": raw_text,
-                                "asr_language": language_value,
-                                "asr_confidence": asr_confidence,
-                                "asr_confidence_metadata": confidence_metadata,
-                                "refiner_deferred": False,
-                            }
+                            transcript_event(
+                                raw_text,
+                                language_value,
+                                asr_confidence,
+                                confidence_metadata,
+                                deferred=False,
+                            )
                         ):
                             break
                         tail_start = max(
@@ -1360,14 +1391,13 @@ def create_app(
                     )
                     if requested_mode in {"online", "streaming"}:
                         if not await send_json(
-                            {
-                                "event": "transcript",
-                                "raw_text": raw_text,
-                                "asr_language": language_value,
-                                "asr_confidence": asr_confidence,
-                                "asr_confidence_metadata": confidence_metadata,
-                                "refiner_deferred": False,
-                            }
+                            transcript_event(
+                                raw_text,
+                                language_value,
+                                asr_confidence,
+                                confidence_metadata,
+                                deferred=False,
+                            )
                         ):
                             break
                         tail_start = max(

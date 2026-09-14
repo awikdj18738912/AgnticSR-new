@@ -1,5 +1,8 @@
 import unittest
-from system.window_refinement import CumulativeWindowRefinement
+from system.window_refinement import (
+    CumulativeWindowRefinement,
+    StreamingRefinementDisplay,
+)
 
 
 class WindowTest(unittest.TestCase):
@@ -151,3 +154,48 @@ class WindowTest(unittest.TestCase):
         self.assertTrue(final["refiner_accepted"])
         self.assertEqual(final["clean_text"], "第一句。")
         self.assertEqual(calls, [("第一句。", False), ("第一句。", True)])
+
+    def test_display_retains_refinement_and_appends_pending_raw_tail(self):
+        self.session.window_size = 1
+        result = self.update("第一句苹果。第二句苹果。")
+        display = StreamingRefinementDisplay()
+        self.assertTrue(display.accept(result, 1))
+
+        payload = display.compose("第一句苹果。第二句苹果。第三句原始文本。")
+
+        self.assertEqual(payload["committed_clean_text"], "第一句梨。")
+        self.assertEqual(payload["active_clean_text"], "第二句梨。")
+        self.assertEqual(payload["display_refined_text"], "第一句梨。第二句梨。")
+        self.assertEqual(payload["pending_raw_text"], "第三句原始文本。")
+        self.assertEqual(
+            payload["display_text"],
+            "第一句梨。第二句梨。第三句原始文本。",
+        )
+        self.assertTrue(payload["has_pending_refinement"])
+
+    def test_display_drops_revised_active_span_but_keeps_committed_prefix(self):
+        self.session.window_size = 1
+        result = self.update("第一句苹果。第二句苹果。")
+        display = StreamingRefinementDisplay()
+        display.accept(result, 3)
+
+        payload = display.compose("第一句苹果。第二句香蕉。")
+
+        self.assertEqual(payload["committed_clean_text"], "第一句梨。")
+        self.assertEqual(payload["active_clean_text"], "")
+        self.assertEqual(payload["display_refined_text"], "第一句梨。")
+        self.assertEqual(payload["pending_raw_text"], "第二句香蕉。")
+        self.assertEqual(payload["display_revision"], 3)
+
+    def test_display_rejects_stale_refinement_revision(self):
+        first = self.update("第一句苹果。")
+        newer = self.update("第一句苹果。第二句苹果。")
+        display = StreamingRefinementDisplay()
+        self.assertTrue(display.accept(newer, 2))
+        self.assertFalse(display.accept(first, 1))
+
+        payload = display.compose("第一句苹果。第二句苹果。")
+
+        self.assertEqual(payload["display_revision"], 2)
+        self.assertEqual(payload["display_text"], "第一句梨。第二句梨。")
+        self.assertFalse(payload["has_pending_refinement"])

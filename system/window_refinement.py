@@ -16,6 +16,149 @@ from .refinement_guard import join_refined_segments
 _SELF_CORRECTION = re.compile(r"(?:不对|不是|而是|应该是)")
 
 
+class StreamingRefinementDisplay:
+    """Compose validated refinements with the newest unrefined ASR tail.
+
+    The Refiner works on an older cumulative hypothesis while ASR continues to
+    advance.  This state keeps source ownership for the last published result,
+    so a newer hypothesis can retain only refinements whose raw source still
+    matches.  Revised source is always shown as pending raw text until a newer
+    refinement validates it.
+    """
+
+    def __init__(self) -> None:
+        self._revision = 0
+        self._raw_text = ""
+        self._clean_text = ""
+        self._spans: tuple[dict[str, str], ...] = ()
+
+    def accept(self, result: dict[str, object], revision: int) -> bool:
+        """Store a completed result unless a newer revision is already known."""
+
+        if revision < self._revision:
+            return False
+        spans = result.get("refinement_source_spans", ())
+        if not isinstance(spans, (list, tuple)):
+            spans = ()
+        validated_spans: list[dict[str, str]] = []
+        for span in spans:
+            if not isinstance(span, dict):
+                continue
+            source_text = span.get("source_text")
+            clean_text = span.get("clean_text")
+            state = span.get("state")
+            if not isinstance(source_text, str) or not isinstance(clean_text, str):
+                continue
+            validated_spans.append(
+                {
+                    "source_text": source_text,
+                    "clean_text": clean_text,
+                    "state": "committed" if state == "committed" else "active",
+                }
+            )
+        self._revision = revision
+        self._raw_text = str(result.get("raw_text", ""))
+        self._clean_text = str(result.get("clean_text", ""))
+        self._spans = tuple(validated_spans)
+        return True
+
+    def compose(self, raw_text: str) -> dict[str, object]:
+        """Return browser display fields for the latest cumulative hypothesis."""
+
+        current_raw = raw_text.strip()
+        if not current_raw:
+            return self._payload("", "", "", "")
+        if not self._raw_text or not self._spans:
+            return self._payload("", "", current_raw, current_raw)
+
+        # The common streaming case is append-only growth.  Preserve the exact
+        # aggregate clean result, including deterministic cleanup that may have
+        # acted across a sentence boundary.
+        if current_raw.startswith(self._raw_text):
+            pending = current_raw[len(self._raw_text) :]
+            display, pending_display = self._join_pending(self._clean_text, pending)
+            committed, active = self._clean_parts(self._spans)
+            return self._payload(
+                committed,
+                active,
+                pending_display,
+                display,
+                refined_text=self._clean_text,
+            )
+
+        # ASR may revise its active tail.  Match complete source-owned spans
+        # from the start and drop the first affected span plus everything after
+        # it.  Refined-text character offsets are intentionally never used.
+        cursor = 0
+        matched: list[dict[str, str]] = []
+        for span in self._spans:
+            source = span["source_text"]
+            if not source or not current_raw.startswith(source, cursor):
+                break
+            cursor += len(source)
+            matched.append(span)
+
+        committed, active = self._clean_parts(matched)
+        refined = clean_transcript_deterministically(
+            join_refined_segments(span["clean_text"] for span in matched)
+        )
+        pending = current_raw[cursor:]
+        display, pending_display = self._join_pending(refined, pending)
+        return self._payload(
+            committed,
+            active,
+            pending_display,
+            display,
+            refined_text=refined,
+        )
+
+    @staticmethod
+    def _clean_parts(
+        spans: list[dict[str, str]] | tuple[dict[str, str], ...]
+    ) -> tuple[str, str]:
+        committed = join_refined_segments(
+            span["clean_text"] for span in spans if span["state"] == "committed"
+        )
+        active = join_refined_segments(
+            span["clean_text"] for span in spans if span["state"] == "active"
+        )
+        return committed, active
+
+    @staticmethod
+    def _join_pending(refined: str, pending: str) -> tuple[str, str]:
+        if not pending:
+            return refined, ""
+        display = join_refined_segments((refined, pending))
+        # join_refined_segments may add one necessary ASCII word separator.
+        pending_display = (
+            display[len(refined) :] if display.startswith(refined) else pending
+        )
+        return display, pending_display
+
+    def _payload(
+        self,
+        committed: str,
+        active: str,
+        pending: str,
+        display: str,
+        *,
+        refined_text: str | None = None,
+    ) -> dict[str, object]:
+        return {
+            "display_revision": self._revision,
+            "committed_clean_text": committed,
+            "active_clean_text": active,
+            "display_refined_text": (
+                join_refined_segments((committed, active))
+                if refined_text is None
+                else refined_text
+            ),
+            "pending_raw_text": pending,
+            "display_text": display,
+            "has_pending_refinement": bool(pending),
+        }
+
+
 class CumulativeWindowRefinement:
     def __init__(self, refine, window_size=3, window_max_chars=80):
         if window_size < 1:
@@ -179,6 +322,12 @@ class CumulativeWindowRefinement:
                 final=final,
                 committed_chunks=start,
             )
+            result["refinement_source_spans"] = self._source_spans(
+                text,
+                chunks,
+                start,
+                parts,
+            )
             return result
 
     def _aggregate(self, parts, raw_text, *, final, committed_chunks):
@@ -247,3 +396,46 @@ class CumulativeWindowRefinement:
             total_chars += candidate_chars
             active_count += 1
         return start
+
+    @staticmethod
+    def _source_spans(text, chunks, active_start, parts):
+        """Map cached outputs back to exact source-owned character spans."""
+
+        if not chunks or not parts:
+            return []
+        starts = []
+        cursor = 0
+        for chunk in chunks:
+            position = text.find(chunk, cursor)
+            if position < 0 or text[cursor:position].strip():
+                return [
+                    {
+                        "source_text": text,
+                        "clean_text": join_refined_segments(
+                            part["clean_text"] for part in parts
+                        ),
+                        "state": "active",
+                    }
+                ]
+            starts.append(cursor)
+            cursor = position + len(chunk)
+
+        spans = []
+        for index in range(active_start):
+            end = starts[index + 1] if index + 1 < len(starts) else len(text)
+            spans.append(
+                {
+                    "source_text": text[starts[index]:end],
+                    "clean_text": parts[index]["clean_text"],
+                    "state": "committed",
+                }
+            )
+        if active_start < len(chunks):
+            spans.append(
+                {
+                    "source_text": text[starts[active_start]:],
+                    "clean_text": parts[-1]["clean_text"],
+                    "state": "active",
+                }
+            )
+        return spans
